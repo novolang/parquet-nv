@@ -1,0 +1,308 @@
+// pqmeta.nv — the footer: file metadata, row groups, column chunks and
+// the statistics a producer claims.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FOOTER IS THE FILE'S INDEX, AND IT IS AT THE END.  A Parquet file
+// is `PAR1 <data> <footer> <int32 footer length> PAR1`, so opening one
+// is: read the last eight bytes, learn the footer's length, read the
+// footer, and now know where every column of every row group is.  That
+// is the whole reason the format is worth its complexity over Arrow's
+// file format, and it is why `pqread` is a request machine rather than
+// a stream decoder.
+//
+// **STATISTICS ARE A PRODUCER'S CLAIM, NOT A FACT.**  Every field in
+// `PqStats` was written by whatever wrote the file, and a reader that
+// skipped a row group because its `max` said so is trusting a number
+// nothing verified.  Three specific hazards, all of them real files:
+//
+//   - `min`/`max` were SIGNED comparisons for `BYTE_ARRAY` in older
+//     writers, so a column of UTF-8 strings has bounds computed with
+//     bytes above 0x7F sorted as negative.  `min_value`/`max_value`
+//     replaced them with unsigned ordering and BOTH are in files.
+//     `stats_are_trustworthy` is the question; it answers false when
+//     only the deprecated pair is present on a `BYTE_ARRAY`.
+//   - `null_count` of zero can mean "no nulls" or "not computed",
+//     because the field is optional and absent reads as zero in most
+//     thrift bindings.  `PqStats` carries presence flags rather than
+//     sentinel values for exactly that.
+//   - a NaN in a float column makes min and max meaningless, and the
+//     format says a writer should omit them.  Some do not.
+//
+// So every predicate that uses statistics is named `may_contain` rather
+// than `contains`, and the sceptical caller has `stats_are_trustworthy`
+// to consult first.
+//
+// THE OFFSET FIELDS DISAGREE WITH EACH OTHER, ON PURPOSE AND BY
+// ACCIDENT.  A column chunk carries `data_page_offset`,
+// `dictionary_page_offset` and `file_offset`, and the rule is that the
+// chunk STARTS at the dictionary page when there is one.  `file_offset`
+// was written wrongly by several producers for years — pointing at the
+// end of the chunk rather than the start — so `chunk_start` computes
+// from the two page offsets and ignores it, which is what every
+// implementation that reads real files does.
+
+use arrowbuf
+
+// What a column chunk's pages are compressed with.
+pub enum PqCodec
+    PqUncompressed
+    // No package on the registry.  See `pqcomp`.
+    PqSnappy
+    PqGzip
+    // Abandoned.  Refused by name.
+    PqLzo
+    // brotli-nv is a planned row and is not published.
+    PqBrotli
+    // The ambiguous older id.  Refused by name; `LZ4_RAW` is the one to
+    // read.
+    PqLz4
+    PqZstd
+    PqLz4Raw
+
+// A producer's claim about the values in a column chunk or a page.
+pub struct PqStats
+    // The deprecated, signed-comparison bounds.  Spans into the footer
+    // bytes the caller holds.
+    min_span: arrowbuf.ArrowBuffer
+    max_span: arrowbuf.ArrowBuffer
+    has_min: Bool
+    has_max: Bool
+    // The unsigned-ordering replacements.
+    min_value_span: arrowbuf.ArrowBuffer
+    max_value_span: arrowbuf.ArrowBuffer
+    has_min_value: Bool
+    has_max_value: Bool
+    null_count: Int
+    has_null_count: Bool
+    distinct_count: Int
+    has_distinct_count: Bool
+    // Whether the producer said the bounds are exact rather than a
+    // truncation.  A long string's bound is often truncated and then
+    // nudged, and a reader that took a truncated max literally excludes
+    // rows that are in the file.
+    is_max_value_exact: Bool
+    is_min_value_exact: Bool
+
+// One page's entry in a column chunk's page index.
+//
+// The page index is a SEPARATE structure from the footer, written near
+// it, and it is what makes a predicate push-down read one page instead
+// of one row group.  Carried here because a caller that has read it
+// wants it beside the chunk it indexes.
+pub struct PqPageLocation
+    offset: Int
+    compressed_page_size: Int
+    // The index of the first row in this page, within the row group.
+    first_row_index: Int
+
+// One column of one row group.
+pub struct PqColumnChunk
+    // The dotted path, matching a `PqColumn`.
+    path: Str
+    physical: PqPhysical
+    codec: PqCodec
+    num_values: Int
+    total_uncompressed_size: Int
+    total_compressed_size: Int
+    // Where the chunk's first data page begins.
+    data_page_offset: Int
+    // Where its dictionary page begins, or `-1`.  When present, THIS is
+    // where the chunk starts.
+    dictionary_page_offset: Int
+    // Where the chunk's own index of page offsets begins, or `-1`.
+    offset_index_offset: Int
+    offset_index_length: Int
+    // Where the chunk's per-page statistics begin, or `-1`.
+    column_index_offset: Int
+    column_index_length: Int
+    // Every encoding the chunk's pages use.  A reader can refuse a
+    // chunk before reading a page by looking here.
+    encodings: [PqEncoding]
+    stats: PqStats
+    has_stats: Bool
+
+// One horizontal slice of the file.
+pub struct PqRowGroup
+    columns: [PqColumnChunk]
+    num_rows: Int
+    total_byte_size: Int
+    // Where the row group's first column chunk begins, or `-1` when the
+    // producer did not write it.  Derived rather than trusted; see
+    // `row_group_start`.
+    file_offset: Int
+    // The ordinal a producer assigned, or `-1`.
+    ordinal: Int
+
+// A key and a value from the file's custom metadata.
+//
+// Where Arrow puts its own schema, among other things: a file written
+// by an Arrow writer carries `ARROW:schema` here, base64-encoded, which
+// is how the round trip keeps a logical type Parquet cannot express.
+pub struct PqKeyValue
+    key: Str
+    value: Str
+    has_value: Bool
+
+// The footer.
+pub struct PqFileMeta
+    version: Int
+    schema: PqSchema
+    num_rows: Int
+    row_groups: [PqRowGroup]
+    key_value_metadata: [PqKeyValue]
+    // The string the producer identifies itself with — `parquet-mr
+    // version 1.12.0`, `parquet-cpp-arrow version 9.0.0`.  Carried and
+    // NOT parsed, but published: several of the hazards in this
+    // module's header are producer-specific, and a tool that diagnoses
+    // a file starts here.
+    created_by: Str
+
+// The four bytes at both ends of a Parquet file — `PAR1`.
+pub fn magic() -> Bytes
+    todo("parquet-nv.pqmeta.magic")
+
+// How many bytes a reader must have from the end of the file before it
+// can find the footer — the four-byte length plus the four-byte magic.
+//
+// ```novo
+// use pqmeta
+//
+// fn main() [io]
+//     println("${pqmeta.tail_bytes()}")
+// ```
+pub fn tail_bytes() -> Int
+    todo("parquet-nv.pqmeta.tail_bytes")
+
+// Where the footer starts, given the last `tail_bytes()` of a file of
+// `file_len` bytes.
+//
+// The whole of "opening" a Parquet file, and published as arithmetic a
+// caller can do before it has the footer — which is what lets a host
+// issue exactly two reads to open a file over a network.
+pub fn footer_position(tail: Bytes, file_len: Int) -> Result<(Int, Int), PqFault>
+    todo("parquet-nv.pqmeta.footer_position")
+
+// The footer, decoded from the bytes at `at`.
+pub fn read_footer(src: Bytes, at: Int, len: Int) -> Result<PqFileMeta, PqFault>
+    todo("parquet-nv.pqmeta.read_footer")
+
+// Where a column chunk actually starts.
+//
+// The dictionary page offset when there is one, the data page offset
+// otherwise — and NOT `file_offset`, which several producers wrote
+// wrongly for years.  Every implementation that reads real files
+// computes it this way; this one says so out loud.
+pub fn chunk_start(c: PqColumnChunk) -> Int
+    todo("parquet-nv.pqmeta.chunk_start")
+
+// The byte range a whole column chunk occupies.
+pub fn chunk_range(c: PqColumnChunk) -> arrowbuf.ArrowBuffer
+    todo("parquet-nv.pqmeta.chunk_range")
+
+// Where a row group starts — the first of its chunks, computed the same
+// way.
+pub fn row_group_start(g: PqRowGroup) -> Int
+    todo("parquet-nv.pqmeta.row_group_start")
+
+// The chunk for a column path within a row group.
+pub fn chunk_of(g: PqRowGroup, path: Str) -> Result<PqColumnChunk, PqFault>
+    todo("parquet-nv.pqmeta.chunk_of")
+
+// The row group at an index.
+pub fn row_group(m: PqFileMeta, i: Int) -> Result<PqRowGroup, PqFault>
+    todo("parquet-nv.pqmeta.row_group")
+
+// The value of a custom metadata key, and whether it was there.
+pub fn metadata_value(m: PqFileMeta, key: Str) -> (Str, Bool)
+    todo("parquet-nv.pqmeta.metadata_value")
+
+// ── Statistics, read sceptically ────────────────────────────────────
+
+// Statistics with nothing claimed.
+pub fn no_stats() -> PqStats
+    todo("parquet-nv.pqmeta.no_stats")
+
+// Whether a chunk's statistics can be relied on for this physical type.
+//
+// THE QUESTION TO ASK BEFORE SKIPPING ANYTHING.  False when only the
+// deprecated signed-comparison bounds are present on a `BYTE_ARRAY`,
+// when a bound is marked inexact, and when the producer is one of the
+// versions known to have written bounds a different way — which is what
+// `created_by` is carried for.
+pub fn stats_are_trustworthy(s: PqStats, physical: PqPhysical, created_by: Str) -> Bool
+    todo("parquet-nv.pqmeta.stats_are_trustworthy")
+
+// Whether a chunk MAY contain a value, comparing against its bounds.
+//
+// `may_contain` and not `contains`: a false answer is a promise the
+// chunk has no such value, and a true answer is only "the bounds do not
+// rule it out".  Answers true whenever the statistics are absent or
+// untrustworthy, which is the only safe default — a predicate push-down
+// that answered false on missing statistics silently drops rows.
+pub fn may_contain(s: PqStats, physical: PqPhysical, value: Bytes, created_by: Str) -> Bool
+    todo("parquet-nv.pqmeta.may_contain")
+
+// Whether a chunk may contain a value in a range.
+pub fn may_overlap(s: PqStats, physical: PqPhysical, low: Bytes, high: Bytes,
+                   created_by: Str) -> Bool
+    todo("parquet-nv.pqmeta.may_overlap")
+
+// Whether every value in the chunk is null, from the null count and the
+// value count.
+//
+// The one statistic-derived answer that is safe when the count is
+// present, because a null count equal to the value count cannot be a
+// truncation or an ordering mistake.
+pub fn is_all_null(s: PqStats, num_values: Int) -> Bool
+    todo("parquet-nv.pqmeta.is_all_null")
+
+// The bounds a caller should read, given which pair is present.
+//
+// Answers the unsigned-ordering pair where it exists and the deprecated
+// pair otherwise, with a flag saying which — because the comparison a
+// caller then makes differs, and a caller that did not know which it
+// got would make the wrong one.
+pub fn bounds_of(s: PqStats) -> (arrowbuf.ArrowBuffer, arrowbuf.ArrowBuffer, Bool)
+    todo("parquet-nv.pqmeta.bounds_of")
+
+// Every way statistics contradict themselves or their chunk.
+pub fn check_stats(s: PqStats, physical: PqPhysical, num_values: Int, path: Str) -> [PqFault]
+    todo("parquet-nv.pqmeta.check_stats")
+
+// Every way a footer contradicts itself — a row group whose chunk count
+// is not the schema's leaf count, a chunk whose path is not a column, a
+// row count that is not the sum of the row groups'.
+pub fn check_footer(m: PqFileMeta) -> [PqFault]
+    todo("parquet-nv.pqmeta.check_footer")
+
+// Whether a footer passes every check.
+pub fn footer_ok(m: PqFileMeta) -> Bool
+    todo("parquet-nv.pqmeta.footer_ok")
+
+// ── The page index, when a caller has read it ───────────────────────
+
+// A column chunk's page locations, decoded from the offset index.
+pub fn read_offset_index(src: Bytes, at: Int, len: Int) -> Result<[PqPageLocation], PqFault>
+    todo("parquet-nv.pqmeta.read_offset_index")
+
+// A column chunk's per-page statistics, decoded from the column index.
+pub fn read_column_index(src: Bytes, at: Int, len: Int) -> Result<[PqStats], PqFault>
+    todo("parquet-nv.pqmeta.read_column_index")
+
+// The pages of a chunk that a predicate cannot rule out.
+//
+// What the page index is FOR: with it, a predicate reads one page of a
+// hundred-megabyte chunk; without it, it reads the chunk.  Answers
+// every page when there is no index, which is the safe default again.
+pub fn pages_that_may_contain(locations: [PqPageLocation], stats: [PqStats], physical: PqPhysical,
+                              value: Bytes, created_by: Str) -> [Int]
+    todo("parquet-nv.pqmeta.pages_that_may_contain")
+
+// The codec's name as the footer spells it.
+pub fn codec_name(c: PqCodec) -> Str
+    todo("parquet-nv.pqmeta.codec_name")
+
+// The codec a footer's code names.
+pub fn codec_of_code(code: Int) -> Result<PqCodec, PqFault>
+    todo("parquet-nv.pqmeta.codec_of_code")

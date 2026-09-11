@@ -1,0 +1,332 @@
+// pqread.nv — the reader: a state machine that ASKS for byte ranges and
+// a host that answers them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// **THE LOAD-BEARING INTERFACE OF THIS PACKAGE IS `PqRequest`.**
+//
+// A Parquet file is not a stream.  Its index is at the END, its columns
+// are contiguous per row group, and the whole reason anybody pays for
+// its complexity over a row format is that a query reading three
+// columns of two hundred reads three columns' worth of bytes.  A
+// feed-and-drain reader — the shape flate-nv, csv-nv and arrow-nv's IPC
+// reader all take — would read the file from the front, which is to say
+// it would read all of it, which is to say it would throw away the
+// format's entire value.
+//
+// So this is `docs/publishing.md`'s THIRD sans-IO shape: the core asks
+// and the host performs.  `step` answers a `PqRequest`; the host reads
+// that range however it reads things — a file, an HTTP range request,
+// an object store — and hands the bytes back to `supply`.  The reader
+// performs nothing, so its budget is `[]`; the host performs everything,
+// so the effects are declared where they are spent; and a caller that
+// is reading over a network gets to batch, reorder and parallelise the
+// requests, which a package that opened files for it could never allow.
+//
+// The whole conversation for a projection over one row group:
+//
+//     step   -> PqWantTail(8)               the footer length and magic
+//     supply
+//     step   -> PqWantRange(at, len)        the footer itself
+//     supply
+//     step   -> PqWantRange(at, len) x3     one per projected column
+//     supply x3
+//     step   -> PqChunkReady(...)  x3
+//     step   -> PqDone
+//
+// Four round trips for a file of any size, and the third one is
+// parallel.  With a page index it is five and the column ranges are
+// smaller; `with_page_index` is that choice, and it is the caller's
+// because the index costs a read.
+//
+// A REQUEST CARRIES WHY IT IS ASKING.  `PqWantRange` names the purpose,
+// so a host reading over a network can prefetch a whole row group when
+// it sees column requests and can cache a footer across queries.  A
+// request that was only `(offset, length)` would make every host guess.
+//
+// AND THE HOST CAN ANSWER WRONGLY, SO THAT IS A FAULT.  `supply` with
+// bytes from an offset the reader did not ask for is
+// `PqRangeMismatch` — a protocol error in the HOST, named as such,
+// because silently decoding them would produce values rather than an
+// error.
+
+use arrowbuf
+
+// Why the reader wants a range.
+//
+// Carried on the request so a host can make an informed decision about
+// prefetching, caching and parallelism.  A reader that answered a bare
+// offset and length would make every host guess at all three.
+pub enum PqPurpose
+    PqForFooter
+    PqForPageIndex
+    PqForColumnChunk(row_group: Int, path: Str)
+    PqForPage(row_group: Int, path: Str, page: Int)
+
+// What the reader wants next.
+//
+// **THE ACTION ENUM.**  Every variant is something the HOST does, and
+// the reader does none of it.
+pub enum PqRequest
+    // The last `n` bytes of the file.  The first thing any reader wants,
+    // and the one request whose position is relative to the END — which
+    // a host that only knows how to read forward has to be told.
+    PqWantTail(n: Int)
+    // `len` bytes at `at`, for `why`.
+    PqWantRange(at: Int, len: Int, why: PqPurpose)
+    // Several ranges the host may fetch in any order, or in parallel,
+    // or coalesced.  Answered instead of a sequence of single requests
+    // whenever the reader knows what it needs — which is the whole of a
+    // projection, once the footer is in.
+    PqWantRanges(ranges: [arrowbuf.ArrowBuffer], why: PqPurpose)
+    // Nothing more is needed to answer what the reader was asked for.
+    PqDone
+
+// What one `step` produced besides its request.
+pub enum PqEvent
+    // The footer, decoded.
+    PqFooterReady(meta: PqFileMeta)
+    // A column chunk's bytes are in hand, as a span into the body the
+    // host most recently supplied.
+    PqChunkReady(row_group: Int, path: Str, body_at: Int, body_len: Int)
+    // A page of a chunk, decompressed into the caller's own scratch
+    // buffer.
+    PqPageReady(row_group: Int, path: Str, page: Int, values_at: Int, values_len: Int)
+    // A codec the file uses and this build cannot run.  An EVENT rather
+    // than a fault when it is discovered at footer time, because a
+    // caller may still want the columns whose codec it does have.
+    PqCodecMissing(codec: Str)
+
+// What one `step` answered.
+pub struct PqStep
+    reader: PqReader
+    request: PqRequest
+    events: [PqEvent]
+
+// The reader.
+pub struct PqReader
+    // The file's length, which a host knows and the format does not
+    // record.  Required up front: every offset in a footer is absolute
+    // and the tail request is relative to this.
+    file_len: Int
+    // The columns the caller asked for, by dotted path.  Empty means
+    // every column, which is a different request plan and not a
+    // shortcut.
+    projection: [Str]
+    // The row groups the caller asked for.  Empty means all.
+    row_groups: [Int]
+    // Whether to read the page index when the footer says there is one.
+    use_page_index: Bool
+    // The largest page this reader will decompress.
+    page_limit: Int
+    // Caller-supplied decompressors for codecs this build lacks.
+    decompressors: [PqDecompressor]
+    config: PqCodecConfig
+    // The footer, once read.
+    has_footer: Bool
+
+// A reader for a file of `file_len` bytes.
+//
+// ```novo
+// use pqread
+//
+// fn main() [io]
+//     let r = pqread.reader(1048576)
+//     match pqread.step(r)
+//         Ok(s)  => println("the first thing a reader wants is the tail")
+//         Err(_) => println("refused")
+// ```
+pub fn reader(file_len: Int) -> PqReader
+    todo("parquet-nv.pqread.reader")
+
+// A reader restricted to these columns.
+//
+// A path that names a GROUP expands to every leaf under it, so
+// `["orders"]` is the whole of a nested column.
+pub fn with_projection(r: PqReader, paths: [Str]) -> PqReader
+    todo("parquet-nv.pqread.with_projection")
+
+// A reader restricted to these row groups.
+pub fn with_row_groups(r: PqReader, indexes: [Int]) -> PqReader
+    todo("parquet-nv.pqread.with_row_groups")
+
+// A reader that will also read the page index when there is one.
+//
+// Off by default, and the trade is explicit: the index costs one more
+// round trip and it turns a chunk-sized read into a page-sized one.
+// Worth it for a selective predicate over a large chunk, not worth it
+// for a scan.  A caller knows which it is doing and this package does
+// not.
+pub fn with_page_index(r: PqReader) -> PqReader
+    todo("parquet-nv.pqread.with_page_index")
+
+// A reader that will not decompress a page past `cap` bytes.
+pub fn with_page_limit(r: PqReader, cap: Int) -> PqReader
+    todo("parquet-nv.pqread.with_page_limit")
+
+// A reader with caller-supplied decompressors.
+pub fn with_decompressors(r: PqReader, d: [PqDecompressor]) -> PqReader
+    todo("parquet-nv.pqread.with_decompressors")
+
+// A reader with a codec configuration.
+pub fn with_config(r: PqReader, cfg: PqCodecConfig) -> PqReader
+    todo("parquet-nv.pqread.with_config")
+
+// What the reader wants next.
+pub fn step(r: PqReader) -> Result<PqStep, PqFault>
+    todo("parquet-nv.pqread.step")
+
+// Answer the reader's last request.
+//
+// `at` is where `body` starts in the FILE, and it must be the offset
+// the reader asked for: anything else is `PqRangeMismatch`, which is a
+// protocol error in the host rather than a corrupt file, because
+// decoding the wrong bytes would produce values.
+pub fn supply(r: PqReader, at: Int, body: Bytes) -> Result<PqStep, PqFault>
+    todo("parquet-nv.pqread.supply")
+
+// Answer several requests at once.
+//
+// The shape a host reading over a network wants: `PqWantRanges` asked
+// for six ranges, six requests went out in parallel, and all six come
+// back here in one call.
+pub fn supply_many(r: PqReader, ranges: [arrowbuf.ArrowBuffer],
+                   bodies: [Bytes]) -> Result<PqStep, PqFault>
+    todo("parquet-nv.pqread.supply_many")
+
+// The footer, once the reader has it.
+pub fn footer_of(r: PqReader) -> Result<PqFileMeta, PqFault>
+    todo("parquet-nv.pqread.footer_of")
+
+// ── Reading a chunk that is already in hand ─────────────────────────
+
+// One column chunk's pages, as headers and payload spans, without
+// decompressing anything.
+//
+// For a caller that wants to inspect a chunk — count pages, check
+// encodings, verify CRCs — or that is about to decompress into its own
+// buffer and does not want this package to choose where.
+pub fn pages_of(body: Bytes, body_at: Int, c: PqColumnChunk) -> Result<[PqPageHeader], PqFault>
+    todo("parquet-nv.pqread.pages_of")
+
+// A chunk's dictionary page, decompressed into a cursor the caller
+// sized.
+//
+// Answered as spans into that cursor's buffer, because a dictionary is
+// read once and referenced by every page after it: copying it out per
+// page is the cost dictionary encoding exists to avoid.
+pub fn dictionary_of(body: Bytes, body_at: Int, c: PqColumnChunk, col: PqColumn,
+                     supplied: [PqDecompressor], cfg: PqCodecConfig,
+                     mut dst: Cursor) -> Result<[arrowbuf.ArrowBuffer], PqFault>
+    todo("parquet-nv.pqread.dictionary_of")
+
+// One data page, decompressed into a cursor the caller sized, with its
+// levels located.
+//
+// Three answers: how many bytes were written, the levels, and where the
+// values begin within them.  Three rather than a struct because the
+// levels are a struct already and the caller needs the count to advance
+// its own cursor.
+pub fn read_page(body: Bytes, body_at: Int, h: PqPageHeader, d: PqDataPage, c: PqColumnChunk,
+                 col: PqColumn, supplied: [PqDecompressor], cfg: PqCodecConfig,
+                 mut dst: Cursor) -> Result<(Int, PqLevels, arrowbuf.ArrowBuffer), PqFault>
+    todo("parquet-nv.pqread.read_page")
+
+// An upper bound on the scratch buffer a chunk's largest page needs.
+//
+// From the page headers, so a caller allocates ONE buffer and reuses it
+// across every page of the chunk — which is what keeps a scan over a
+// gigabyte file inside a few megabytes of memory.
+pub fn scratch_bound(headers: [PqPageHeader]) -> Int
+    todo("parquet-nv.pqread.scratch_bound")
+
+// The byte ranges a projection over a row group needs.
+//
+// Published as arithmetic a caller can do with only the footer, so a
+// host that wants to plan its own reads — coalescing, prefetching,
+// splitting across workers — does not have to drive the state machine
+// to find out what it will be asked for.
+pub fn ranges_for(m: PqFileMeta, row_group: Int,
+                  paths: [Str]) -> Result<[arrowbuf.ArrowBuffer], PqFault>
+    todo("parquet-nv.pqread.ranges_for")
+
+// The same ranges, coalesced where the gap between two is under
+// `max_gap`.
+//
+// Two column chunks eighty bytes apart are one request over a network
+// and two over a local file, so the threshold is the caller's.
+pub fn coalesce(ranges: [arrowbuf.ArrowBuffer], max_gap: Int) -> [arrowbuf.ArrowBuffer]
+    todo("parquet-nv.pqread.coalesce")
+
+// How many bytes a projection will read, against the file's size.
+//
+// The number that says whether the projection was worth expressing, and
+// the one a caller logs.  Answerable from the footer alone.
+pub fn projected_bytes(m: PqFileMeta, paths: [Str]) -> Result<Int, PqFault>
+    todo("parquet-nv.pqread.projected_bytes")
+
+// ── Taking a whole file from a host ─────────────────────────────────
+
+// **The trait that crosses the layer.**
+//
+// One method, because one method is what a Parquet reader needs and
+// because it is the method every host can supply: a local file seeks
+// and reads, an HTTP source sends a `Range` header, an object store
+// takes an offset and a length in its own API.  The standard library's
+// `Seek[e]` and `Read[e]` are the wrong shape for the middle one —
+// there is no cursor in an object store to move — so the trait is
+// declared here, over the operation, rather than over the mechanism.
+//
+// The trait binds one effect parameter, `e`, and the member uses it
+// (SPEC § 5.6 requires both).  An impl supplies what its own reading
+// costs: `impl PqSource[io, fs] for File`, `impl PqSource[net] for
+// HttpRange`, `impl PqSource[] for Bytes` in a test.  That last one is
+// what makes a reader testable without a filesystem.
+pub trait PqSource[e]
+    // `len` bytes at `at`.  A short answer is not an error here — the
+    // reader compares what it got against what it asked for and answers
+    // `PqRangeShort` itself, so an impl may simply return what it has.
+    fn read_at(self, at: Int, len: Int) -> Result<Bytes, IoError> [e]
+
+// Read a row group's projected columns, and be charged exactly what the
+// source costs.
+//
+// The row is `[e]`: this call costs what `S`'s own `PqSource` impl
+// costs, and that impl is declared where the host is.  A `core` package
+// can therefore read a file it never opened without leaving its own
+// budget, which is the whole reason SPEC § 5.6 gives functions the
+// binding.
+//
+// The convenience over the request machine, NOT a replacement: it
+// answers the requests in order, one round trip at a time, which is
+// exactly what a caller reading over a network should not do.  A caller
+// that can parallelise drives `step` and `supply` itself, and the
+// difference is the reason both exist.
+//
+// ```novo
+// use pqread
+//
+// fn one_group<S: pqread.PqSource[e]>(src: S, len: Int)
+//     -> Result<[PqEvent], PqFault> [e]
+//     pqread.read_row_group(src, len, 0, ["price"])
+//
+// fn main() [io]
+//     println("a core reader, charged what the host's source costs")
+// ```
+pub fn read_row_group<S: PqSource[e]>(src: S, file_len: Int, row_group: Int,
+                                      paths: [Str]) -> Result<[PqEvent], PqFault> [e]
+    todo("parquet-nv.pqread.read_row_group")
+
+// The footer alone, from a source.
+//
+// Two reads, and the one call a caller makes to find out what is in a
+// file before deciding whether to read any of it.
+pub fn read_footer_from<S: PqSource[e]>(src: S, file_len: Int) -> Result<PqFileMeta, PqFault> [e]
+    todo("parquet-nv.pqread.read_footer_from")
+
+// Every request the reader makes, answered in order.
+//
+// The fully driven form, for a caller that wants the whole projection
+// and has no opinion about how the reads happen.
+pub fn read_all<S: PqSource[e]>(src: S, r: PqReader) -> Result<[PqEvent], PqFault> [e]
+    todo("parquet-nv.pqread.read_all")

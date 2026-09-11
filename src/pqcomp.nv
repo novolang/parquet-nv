@@ -1,0 +1,205 @@
+// pqcomp.nv — page compression: three codecs through the published
+// packages, three named as unavailable, one refused.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// PARQUET COMPRESSES PER PAGE, WHICH IS WHY THIS IS SMALL.  A page's
+// payload is one complete stream of its codec — a gzip stream, a zstd
+// frame, an LZ4 block — with its uncompressed size in the page header.
+// So decompression here is one call into an already-published codec
+// and a length check, and there is no state to carry between pages.
+//
+// **THE REGISTRY DOES NOT HAVE SNAPPY, AND SNAPPY IS THE DEFAULT.**
+// The reference writers (`parquet-mr`, `parquet-cpp`) default to
+// `SNAPPY`, and the majority of Parquet files in the world are
+// compressed with it.  There is no `snappy-nv` on the registry and this
+// package will not grow a second copy of one.  Two things follow, and
+// both are in the surface rather than in a comment:
+//
+//   1. `PqCodecUnavailable` is an UNAVAILABLE fault, not a corrupt one,
+//      so a caller reports its own build rather than somebody's file.
+//   2. `PqDecompressor` is a pair of NAMED FUNCTIONS the caller may
+//      supply, so a program that has a Snappy implementation — from an
+//      FFI binding, from its own source — reads those files through
+//      this package without waiting for a row.  Named functions and not
+//      a closure, because a lambda that becomes a value is refused at
+//      the embedded tier and because a named function is the shape the
+//      rest of this grid uses.
+//
+// **This lane's report asks for a `snappy-nv` row on the grid.**  It is
+// the single largest gap between this package and a reader that opens
+// an arbitrary Parquet file.  brotli-nv is already a row (P2, not yet
+// published) and gets the same treatment in the meantime.
+//
+// `LZ4` AND `LZ4_RAW` ARE NOT THE SAME CODEC, and this is the other
+// place a reader silently goes wrong.  `LZ4_RAW` is the LZ4 BLOCK
+// format — no frame header, no checksum — which is `lz4block.
+// decompress` with the page header's uncompressed size as the capacity.
+// The older `LZ4` id meant the FRAME format in some writers and a
+// Hadoop-framed variant in others; the format's own specification
+// deprecated it for that reason.  It is refused by name here rather
+// than guessed at, because guessing wrong produces bytes rather than an
+// error.
+//
+// THE WINDOW BUDGET CROSSES THE INTERFACE.  A page header can declare a
+// two-gigabyte uncompressed size.  `decompress_into` takes the caller's
+// destination cursor, so the budget is the buffer the caller already
+// sized, and `PqPageTooLarge` is answered before anything is read.
+
+use flate
+use zstddec
+use zstdenc
+
+// How this package configures each codec it can run natively.
+//
+// Published rather than hidden, because every one of these is a
+// decision a reader can disagree with and none of them is visible from
+// a decompressed page.  A caller that wants a tighter zstd window, or
+// that has measured a level, sets it here instead of forking the
+// decoder.
+pub struct PqCodecConfig
+    // The flate-nv format a `GZIP` page is read as.  `GzipWrapped`,
+    // because Parquet's `GZIP` is a gzip stream with its header — not a
+    // raw deflate stream and not a zlib one, which are the two things a
+    // reader reaches for first and which both fail on byte one.
+    gzip_format: flate.FlateFormat
+    // The window a zstd frame may demand, in bytes.  zstd-nv makes the
+    // caller state it because a frame header can ask for 3.75 GiB, and
+    // this package passes the caller's number straight through rather
+    // than choosing one on its behalf.
+    zstd_window_limit: Int
+    // The zstd level a writer compresses at.
+    zstd_level: Int
+
+// The configuration a reader gets when it says nothing.
+pub fn default_config() -> PqCodecConfig
+    todo("parquet-nv.pqcomp.default_config")
+
+// The flate-nv format a `GZIP` page is read as.
+pub fn gzip_format(cfg: PqCodecConfig) -> flate.FlateFormat
+    todo("parquet-nv.pqcomp.gzip_format")
+
+// A zstd decoder configured with the caller's window limit.
+pub fn zstd_decoder(cfg: PqCodecConfig) -> zstddec.ZstDecoder
+    todo("parquet-nv.pqcomp.zstd_decoder")
+
+// A zstd encoder at the configured level.
+pub fn zstd_encoder(cfg: PqCodecConfig) -> Result<zstdenc.ZstEncoder, PqFault>
+    todo("parquet-nv.pqcomp.zstd_encoder")
+
+// A decompressor a caller supplies for a codec this build does not
+// have.
+//
+// Two NAMED functions: one that answers the decompressed size a payload
+// will produce, and one that decompresses into a buffer.  The first
+// exists because a caller that could only decompress would have to
+// allocate on a size a file declared, which is the check this package
+// makes everywhere else.
+pub struct PqDecompressor
+    codec: PqCodec
+    // Answers the uncompressed length, or a negative number when the
+    // payload is malformed.
+    sized_by: fn(Bytes, Int, Int) -> Int
+    // Decompresses `len` bytes at `at` into a fresh buffer, answering
+    // it and a flag for whether it succeeded.
+    run: fn(Bytes, Int, Int) -> Bytes
+
+// No caller-supplied codecs.
+//
+// The honest default, and the one that makes `PqCodecUnavailable`
+// reachable rather than theoretical.
+//
+// ```novo
+// use pqcomp
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(pqcomp.no_decompressors())}")
+// ```
+pub fn no_decompressors() -> [PqDecompressor]
+    todo("parquet-nv.pqcomp.no_decompressors")
+
+// A decompressor for a codec, built from two named functions.
+pub fn decompressor(codec: PqCodec, sized_by: fn(Bytes, Int, Int) -> Int,
+                    run: fn(Bytes, Int, Int) -> Bytes) -> PqDecompressor
+    todo("parquet-nv.pqcomp.decompressor")
+
+// Whether this build can decompress a codec without help.
+//
+// True for `UNCOMPRESSED`, `GZIP`, `ZSTD` and `LZ4_RAW`; false for
+// `SNAPPY`, `BROTLI`, `LZO` and the deprecated `LZ4`.
+pub fn is_native(codec: PqCodec) -> Bool
+    todo("parquet-nv.pqcomp.is_native")
+
+// Whether a codec can be read at all, given what the caller supplied.
+//
+// The question to ask over a FOOTER, before reading a single page: a
+// file whose chunks are all Snappy and a build with no Snappy is a
+// refusal that should happen at open time and name the codec, not on
+// page 4000.
+pub fn can_read(codec: PqCodec, supplied: [PqDecompressor]) -> Bool
+    todo("parquet-nv.pqcomp.can_read")
+
+// Every codec a file uses that this build cannot read.
+//
+// One call over a footer, answering names a caller can put in one
+// message.
+pub fn unreadable_codecs(m: PqFileMeta, supplied: [PqDecompressor]) -> [Str]
+    todo("parquet-nv.pqcomp.unreadable_codecs")
+
+// Decompress a page payload into a cursor the caller sized.
+//
+// The caller's buffer IS the budget: a page whose declared uncompressed
+// size is larger than the cursor's room is `PqPageTooLarge` carrying
+// both numbers, and nothing is read.  For `UNCOMPRESSED` this is a
+// copy, which is deliberate — a caller that wants to avoid it uses
+// `payload_span` directly, and `is_native`/`payload_is_compressed` are
+// how it knows it may.
+pub fn decompress_into(src: Bytes, payload: arrowbuf.ArrowBuffer, codec: PqCodec,
+                       uncompressed_size: Int, supplied: [PqDecompressor],
+                       mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqcomp.decompress_into")
+
+// Decompress a page payload, allocating.
+//
+// The convenience for a caller reading one page, and the one that does
+// what `decompress_into` exists to avoid.  Still bounded: `limit` is
+// the caller's ceiling and a declared size past it is refused before
+// anything is allocated.
+pub fn decompress(src: Bytes, payload: arrowbuf.ArrowBuffer, codec: PqCodec, uncompressed_size: Int,
+                  limit: Int, supplied: [PqDecompressor]) -> Result<Bytes, PqFault>
+    todo("parquet-nv.pqcomp.decompress")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The codecs this package's writer can emit.
+//
+// `UNCOMPRESSED`, `GZIP` and `ZSTD`.  Not `LZ4_RAW`: lz4-nv's block
+// encoder takes a hash table the caller sizes, which is a knob a page
+// writer would have to invent a default for, and the size difference
+// against ZSTD does not pay for the decision.
+pub fn writable_codecs() -> [PqCodec]
+    todo("parquet-nv.pqcomp.writable_codecs")
+
+// An upper bound on the compressed size of `n` bytes under a codec.
+//
+// Every codec can grow incompressible input, so a writer sizing a page
+// buffer needs the worst case rather than the input's length — which is
+// the number this answers and the reason a writer that assumed "at
+// most the input" corrupts on random data.
+pub fn compress_bound(codec: PqCodec, n: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqcomp.compress_bound")
+
+// Compress a page payload into a cursor the caller sized.
+pub fn compress_into(src: Bytes, at: Int, len: Int, codec: PqCodec,
+                     mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqcomp.compress_into")
+
+// Whether a writer should store this page uncompressed after all.
+//
+// The v2 `is_compressed` flag's decision: a page the codec did not
+// shrink is stored raw, which costs a reader nothing and saves it a
+// decompression.  Published because a writer that always compressed
+// would produce the pages whose flag readers get wrong.
+pub fn should_store_raw(compressed: Int, uncompressed: Int) -> Bool
+    todo("parquet-nv.pqcomp.should_store_raw")

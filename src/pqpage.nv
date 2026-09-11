@@ -1,0 +1,219 @@
+// pqpage.nv — the page: its header, its two versions, and the payload
+// layout each of them implies.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A COLUMN CHUNK IS A SEQUENCE OF PAGES WITH NO INDEX INSIDE IT.  A
+// page header is a thrift struct written immediately before the page's
+// bytes, and the only way to find page `n` is to read pages `0` to
+// `n-1`'s headers and add up their sizes.  The page index in the footer
+// is what fixes that, and it is optional — so `pqread` asks for a
+// chunk's whole byte range when there is no index and for one page's
+// when there is, and the difference is the whole value of the index.
+//
+// TWO PAGE VERSIONS, AND THEY DIFFER IN WHERE THE LEVELS LIVE:
+//
+//   V1   the repetition and definition streams are INSIDE the
+//        compressed payload, each with a four-byte length prefix,
+//        repetition first.  So a reader must decompress before it can
+//        count nulls.
+//   V2   the streams are OUTSIDE the compressed payload — uncompressed,
+//        with their lengths in the header.  So a reader can count
+//        nulls, find record boundaries and decide to skip the page
+//        WITHOUT decompressing it, which is the point of the version.
+//
+// That difference is why `PqDataPage` carries the two lengths and why
+// `levels_are_compressed` is a published question rather than a branch
+// hidden in a decoder: a caller doing predicate push-down over v2 pages
+// gets something it cannot get over v1 pages, and it should be able to
+// ask.
+//
+// V2 ALSO CARRIES `is_compressed`, AND IT MAY BE FALSE.  A v2 page in a
+// chunk whose codec is ZSTD may still be stored uncompressed — because
+// the writer found it did not shrink — and a reader that decompressed
+// on the strength of the CHUNK's codec produces a fault on a valid
+// file.  The flag is per page and it is in the header for that reason.
+//
+// A DICTIONARY PAGE IS NOT A DATA PAGE.  It has its own header type,
+// it is the FIRST page of a chunk when it exists, it carries no levels,
+// and its `num_values` is the dictionary's size rather than a row
+// count.  One `PqPageHeader` with a kind, because that is what the
+// thrift struct is, and mixing them up is caught at the kind rather
+// than at the fourth field.
+
+use arrowbuf
+
+// Which kind of page a header describes.
+pub enum PqPageKind
+    // The original data page.  Levels inside the payload.
+    PqDataPageV1
+    // The second data page format.  Levels outside it.
+    PqDataPageV2
+    // A chunk's dictionary, always first.
+    PqDictionaryPage
+    // A page of per-value index data, written by very few producers and
+    // read by fewer.  Stepped over by name.
+    PqIndexPage
+
+// One page's header.
+pub struct PqPageHeader
+    kind: PqPageKind
+    // The payload's size on disk, after compression.
+    compressed_size: Int
+    // Its size after decompression, which is what a caller budgets
+    // against.
+    uncompressed_size: Int
+    // The CRC32 of the compressed payload, when the producer wrote one.
+    crc: Int
+    has_crc: Bool
+    // Where the payload starts — immediately after the header.
+    payload_at: Int
+    // How long the header itself was, so a reader can step to the next
+    // page.
+    header_len: Int
+
+// A data page's own fields, either version.
+pub struct PqDataPage
+    // How many level SLOTS the page covers.  Not the number of stored
+    // values, and not the number of records.
+    num_values: Int
+    // For v2, how many of those slots hold a stored value.  `-1` for
+    // v1, which does not record it — the reason a v1 reader must
+    // decode the definition stream before it can size the values.
+    num_non_null: Int
+    // For v2, how many records the page covers.  `-1` for v1.
+    num_rows: Int
+    encoding: PqEncoding
+    definition_encoding: PqEncoding
+    repetition_encoding: PqEncoding
+    // For v2, the byte lengths of the two uncompressed level streams.
+    // `0` for v1.
+    definition_len: Int
+    repetition_len: Int
+    // For v2, whether the payload after the levels is compressed at
+    // all.  True for v1, always.
+    is_compressed: Bool
+    stats: PqStats
+    has_stats: Bool
+
+// A dictionary page's own fields.
+pub struct PqDictionaryHeader
+    // The number of entries in the dictionary.
+    num_values: Int
+    // `PLAIN` in practice; `PLAIN_DICTIONARY` on a dictionary page
+    // means the same thing.
+    encoding: PqEncoding
+    // Whether the producer claims the dictionary is sorted, which lets
+    // a reader compare indices instead of values.  A claim.
+    is_sorted: Bool
+
+// The header of the page at `at`.
+//
+// ```novo
+// use pqpage
+//
+// fn main() [io]
+//     println("a page header is a thrift struct before its bytes")
+// ```
+pub fn read_header(src: Bytes, at: Int) -> Result<PqPageHeader, PqFault>
+    todo("parquet-nv.pqpage.read_header")
+
+// A data page's fields, for a header whose kind is one of the two data
+// kinds.
+pub fn read_data_page(src: Bytes, h: PqPageHeader) -> Result<PqDataPage, PqFault>
+    todo("parquet-nv.pqpage.read_data_page")
+
+// A dictionary page's fields.
+pub fn read_dictionary_header(src: Bytes, h: PqPageHeader) -> Result<PqDictionaryHeader, PqFault>
+    todo("parquet-nv.pqpage.read_dictionary_header")
+
+// Where the next page's header begins.
+//
+// The whole of "iterating a chunk without an index": header length plus
+// compressed size.  A reader that used the UNcompressed size here walks
+// off the chunk on the first compressed page.
+pub fn next_page_at(h: PqPageHeader) -> Int
+    todo("parquet-nv.pqpage.next_page_at")
+
+// The span the page's compressed payload occupies.
+pub fn payload_span(h: PqPageHeader) -> arrowbuf.ArrowBuffer
+    todo("parquet-nv.pqpage.payload_span")
+
+// Whether this page's level streams are inside the compressed payload.
+//
+// True for v1 and false for v2, and published because it decides
+// whether a caller can count nulls without decompressing — which is
+// what predicate push-down over a chunk needs to know.
+pub fn levels_are_compressed(k: PqPageKind) -> Bool
+    todo("parquet-nv.pqpage.levels_are_compressed")
+
+// Whether a page's payload is compressed, given the chunk's codec.
+//
+// NOT just "the codec is not UNCOMPRESSED": a v2 page carries its own
+// flag, and a writer that found a page did not shrink stores it raw in
+// a chunk whose codec says ZSTD.  A reader that decompressed on the
+// chunk's codec alone produces a fault on a valid file.
+pub fn payload_is_compressed(h: PqPageHeader, d: PqDataPage, codec: PqCodec) -> Bool
+    todo("parquet-nv.pqpage.payload_is_compressed")
+
+// The span of a v2 page's UNcompressed level bytes, which sit before
+// the payload proper.
+pub fn v2_level_span(h: PqPageHeader, d: PqDataPage) -> arrowbuf.ArrowBuffer
+    todo("parquet-nv.pqpage.v2_level_span")
+
+// The span of a v2 page's values, after its level streams.
+pub fn v2_values_span(h: PqPageHeader, d: PqDataPage) -> arrowbuf.ArrowBuffer
+    todo("parquet-nv.pqpage.v2_values_span")
+
+// Whether a page's declared CRC matches its payload.
+//
+// Optional and OFF the read path: verifying a CRC on every page of a
+// file nobody has a corruption problem with is a scan for nothing.  A
+// caller that suspects a file runs this; a caller streaming a chunk
+// does not.
+pub fn crc_matches(src: Bytes, h: PqPageHeader) -> Bool
+    todo("parquet-nv.pqpage.crc_matches")
+
+// Every way a page header contradicts its chunk — a value count past
+// the chunk's, a compressed size past the chunk's range, an encoding
+// the column's physical type does not allow, an uncompressed size past
+// a caller's budget.
+pub fn check_page(h: PqPageHeader, d: PqDataPage, c: PqColumn, limit: Int) -> [PqFault]
+    todo("parquet-nv.pqpage.check_page")
+
+// The kind's name, for a fault report.
+pub fn page_kind_name(k: PqPageKind) -> Str
+    todo("parquet-nv.pqpage.page_kind_name")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// A v1 data page header written into a cursor.
+//
+// v1 rather than v2 for a first writer, and the argument is the same as
+// `pqencode.writable_encodings`': every reader in existence reads v1,
+// and v2 was specified in 2016 and is still refused by readers that
+// exist in production.  `write_data_page_v2_header` is published beside
+// it for a caller that knows its consumers.
+pub fn write_data_page_v1_header(d: PqDataPage, compressed_size: Int, uncompressed_size: Int,
+                                 mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqpage.write_data_page_v1_header")
+
+// A v2 data page header.
+pub fn write_data_page_v2_header(d: PqDataPage, compressed_size: Int, uncompressed_size: Int,
+                                 mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqpage.write_data_page_v2_header")
+
+// A dictionary page header.
+pub fn write_dictionary_header(h: PqDictionaryHeader, compressed_size: Int, uncompressed_size: Int,
+                               mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqpage.write_dictionary_header")
+
+// An upper bound on a page header's size.
+//
+// Needed BEFORE the payload is written, because the header precedes it
+// and carries its compressed size — so a writer either writes the
+// payload into a scratch buffer first or reserves this many bytes and
+// backfills.  The bound is what makes the second possible, and the
+// second is what keeps a `core` writer from allocating.
+pub fn header_bound(kind: PqPageKind, has_stats: Bool) -> Int
+    todo("parquet-nv.pqpage.header_bound")

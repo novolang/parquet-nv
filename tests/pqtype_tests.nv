@@ -1,0 +1,220 @@
+// pqtype_tests.nv — the levels, which are the part of Parquet that is
+// not obvious, and the flattening that decides which bytes are which
+// column.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE NESTING.  A flat required column is where every
+// implementation agrees; the disagreement is at `a.b.c` with an
+// optional root, a repeated group and an optional leaf, where ONE
+// integer has to distinguish "a is null", "b is empty", "c is null" and
+// "c has a value".  The schema in `nested_schema` below is the one from
+// the format's own documentation, and its two maximum levels are the
+// numbers every reader must agree on before it reads a byte.
+
+use std.test
+use std.list
+use pqtype
+use pqlevel
+
+// message schema {
+//   optional group a {
+//     repeated group b {
+//       optional int32 c;
+//     }
+//   }
+//   required int64 flat;
+// }
+fn nested_schema() -> PqSchema
+    let c = pqtype.leaf("c", PqOptional, PqInt32)
+    let b = pqtype.group("b", PqRepeated, [c])
+    let a = pqtype.group("a", PqOptional, [b])
+    let flat = pqtype.leaf("flat", PqRequired, PqInt64)
+    let root = pqtype.group("schema", PqRequired, [a, flat])
+    match pqtype.schema(root)
+        Ok(s)  => s
+        Err(_) => PqSchema { root: root, columns: [] }
+
+@test
+fn test_the_maximum_levels_are_arithmetic_over_the_path() [io]
+    let s = nested_schema()
+
+    test.case("two leaves, so two column chunks per row group")
+    test.assert(list.len(s.columns) == 2)
+
+    test.case("a.b.c has definition 3 — one per optional or repeated ancestor")
+    match pqtype.column(s, "a.b.c")
+        Err(_)  => test.assert(false)
+        Ok(col) =>
+            test.assert(col.max_definition_level == 3)
+
+            test.case("and repetition 1 — one per REPEATED ancestor only")
+            test.assert(col.max_repetition_level == 1)
+
+    test.case("a flat required column has neither, and that means neither STREAM")
+    match pqtype.column(s, "flat")
+        Err(_)  => test.assert(false)
+        Ok(col) =>
+            test.assert(col.max_definition_level == 0)
+            test.assert(col.max_repetition_level == 0)
+            test.assert(pqlevel.stream_is_present(col.max_definition_level) == false)
+            test.assert(pqlevel.stream_is_present(col.max_repetition_level) == false)
+
+@test
+fn test_the_bit_width_of_a_level_is_what_makes_nesting_cheap() [io]
+    test.case("a maximum of zero is no bits, because there is no stream")
+    test.assert(pqlevel.bit_width(0) == 0)
+
+    test.case("a maximum of one is one bit — a nullable flat column")
+    test.assert(pqlevel.bit_width(1) == 1)
+
+    test.case("a maximum of three is TWO bits, not four and not a byte")
+    test.assert(pqlevel.bit_width(3) == 2)
+
+    test.case("and the boundary is at a power of two plus one")
+    test.assert(pqlevel.bit_width(4) == 3)
+    test.assert(pqlevel.bit_width(7) == 3)
+    test.assert(pqlevel.bit_width(8) == 4)
+
+@test
+fn test_the_column_paths_are_the_pre_order_walk_of_the_leaves() [io]
+    let s = nested_schema()
+
+    test.case("dotted from the root, root name EXCLUDED")
+    test.assert(s.columns[0].path == "a.b.c")
+    test.assert(s.columns[1].path == "flat")
+
+    test.case("and kept as segments too, because a field name may contain a dot")
+    test.assert(list.len(s.columns[0].segments) == 3)
+    test.assert(s.columns[0].segments[2] == "c")
+
+    test.case("a path that is not a column answers -1 rather than a fault")
+    test.assert(pqtype.column_index(s, "a.b") == 0 - 1)
+    test.assert(pqtype.column_index(s, "flat") == 1)
+
+    test.case("but a PROJECTION naming a group expands to its leaves")
+    match pqtype.project(s, ["a"])
+        Ok(cols) => test.assert(list.len(cols) == 1)
+        Err(_)   => test.assert(false)
+
+@test
+fn test_the_footer_stores_a_flat_list_and_the_tree_is_rebuilt_from_it() [io]
+    let s = nested_schema()
+    let pair = pqtype.flatten_schema(s)
+
+    test.case("five elements: the root, a, b, c and flat")
+    test.assert(list.len(pair.0) == 5)
+
+    test.case("and a child count per element, which is what says leaf or group")
+    test.assert(list.len(pair.1) == 5)
+    test.assert(pair.1[0] == 2)
+    test.assert(pair.1[3] == 0)
+
+    test.case("the round trip rebuilds the same leaves")
+    match pqtype.schema_of_flat(pair.0, pair.1)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(list.len(r.columns) == 2)
+            test.assert(r.columns[0].path == "a.b.c")
+
+@test
+fn test_a_plain_boolean_is_one_bit_and_a_byte_array_has_no_fixed_width() [io]
+    test.case("BOOLEAN answers zero, because it is a BIT and not a byte")
+    test.assert(pqtype.fixed_width_bytes(PqBoolean, 0) == 0)
+    test.assert(pqtype.is_bit_packed_physical(PqBoolean))
+
+    test.case("the fixed-width types are their widths")
+    test.assert(pqtype.fixed_width_bytes(PqInt32, 0) == 4)
+    test.assert(pqtype.fixed_width_bytes(PqInt64, 0) == 8)
+    test.assert(pqtype.fixed_width_bytes(PqFloat, 0) == 4)
+    test.assert(pqtype.fixed_width_bytes(PqDouble, 0) == 8)
+
+    test.case("INT96 is twelve, and it is deprecated rather than absent")
+    test.assert(pqtype.fixed_width_bytes(PqInt96, 0) == 12)
+
+    test.case("BYTE_ARRAY is length-prefixed, so it has no width")
+    test.assert(pqtype.fixed_width_bytes(PqByteArray, 0) == 0)
+    test.assert(pqtype.is_bit_packed_physical(PqByteArray) == false)
+
+    test.case("and FIXED_LEN_BYTE_ARRAY is whatever the schema said")
+    test.assert(pqtype.fixed_width_bytes(PqFixedLenByteArray, 16) == 16)
+
+@test
+fn test_a_decimal_must_fit_the_bytes_it_is_stored_in() [io]
+    test.case("four bytes hold nine digits")
+    test.assert(pqtype.decimal_max_precision(4) == 9)
+
+    test.case("eight hold eighteen, and sixteen hold thirty-eight")
+    test.assert(pqtype.decimal_max_precision(8) == 18)
+    test.assert(pqtype.decimal_max_precision(16) == 38)
+
+    test.case("so a DECIMAL(20) in four bytes is refused")
+    let bad = pqtype.annotated_leaf("d", PqRequired, PqFixedLenByteArray, 4,
+                                    PqLogDecimal(20, 2))
+    test.assert(list.len(pqtype.check_element(bad)) > 0)
+
+    test.case("and a scale past the precision is not a decimal at all")
+    let worse = pqtype.annotated_leaf("d", PqRequired, PqFixedLenByteArray, 16,
+                                      PqLogDecimal(10, 12))
+    test.assert(list.len(pqtype.check_element(worse)) > 0)
+
+@test
+fn test_the_three_level_list_shape_has_names_the_specification_fixes() [io]
+    let element = pqtype.leaf("element", PqOptional, PqInt64)
+    let l = pqtype.list_of("items", PqOptional, element)
+
+    test.case("the built shape passes its own check")
+    test.assert(list.len(pqtype.check_element(l)) == 0)
+
+    test.case("it is three levels, not one")
+    test.assert(list.len(l.children) == 1)
+    test.assert(l.children[0].name == "list")
+    test.assert(list.len(l.children[0].children) == 1)
+    test.assert(l.children[0].children[0].name == "element")
+
+    test.case("and the middle level is REPEATED, which is where the repetition comes from")
+    match l.children[0].repetition
+        PqRepeated => test.assert(true)
+        _          => test.assert(false)
+
+@test
+fn test_the_two_annotation_systems_can_disagree_and_the_newer_one_wins() [io]
+    let e = PqSchemaElement { name: "t", repetition: PqOptional,
+                              physical: PqInt64, type_length: 0,
+                              converted: PqConvTimestampMillis,
+                              logical: PqLogTimestamp(true, PqMicros),
+                              children: [], field_id: 0 - 1 }
+
+    test.case("LogicalType wins, because it can express what ConvertedType cannot")
+    match pqtype.logical_of(e)
+        PqLogTimestamp(adjusted, unit) =>
+            test.assert(adjusted)
+            match unit
+                PqMicros => test.assert(true)
+                _        => test.assert(false)
+        _                              => test.assert(false)
+
+    test.case("and the disagreement is reported rather than hidden")
+    test.assert(pqtype.converted_disagrees(e))
+
+    test.case("an element with only a converted type is promoted")
+    let old = PqSchemaElement { name: "s", repetition: PqRequired,
+                                physical: PqByteArray, type_length: 0,
+                                converted: PqConvUtf8, logical: PqLogNone,
+                                children: [], field_id: 0 - 1 }
+    match pqtype.logical_of(old)
+        PqLogString => test.assert(true)
+        _           => test.assert(false)
+    test.assert(pqtype.converted_disagrees(old) == false)
+
+@test
+fn test_duplicate_column_paths_are_reported_because_every_lookup_breaks() [io]
+    let one = pqtype.leaf("id", PqRequired, PqInt64)
+    let two = pqtype.leaf("id", PqOptional, PqByteArray)
+    let root = pqtype.group("schema", PqRequired, [one, two])
+    match pqtype.schema(root)
+        Err(_) => test.assert(true)
+        Ok(s)  =>
+            test.assert(list.len(pqtype.check_schema(s)) > 0)
+            test.assert(pqtype.schema_ok(s) == false)

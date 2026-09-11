@@ -1,0 +1,251 @@
+// pqthrift.nv — the Thrift compact protocol subset Parquet's metadata
+// needs, and nothing else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A SUBSET, DECLARED, THE WAY arrow-nv DECLARES ITS FLATBUFFERS SUBSET.
+// Thrift as a system is an IDL, a code generator, four protocols, three
+// transports and an RPC layer.  Parquet uses one protocol — compact —
+// to encode a handful of structs, and it uses seven of its wire types:
+// `BOOLEAN_TRUE`, `BOOLEAN_FALSE`, `I32`, `I64`, `BINARY`, `LIST` and
+// `STRUCT`.  That is this module.
+//
+// A thrift-nv is a row somebody may want.  It is not this row, and
+// depending on a package that does not exist is not a design.  What
+// Parquet needs is read-only field-header arithmetic over bytes the
+// caller holds, each function one line of the compact-protocol
+// specification, which a reviewer can check against it directly.
+//
+// THE THING THAT MAKES COMPACT COMPACT, and the thing a hand-written
+// reader gets wrong: a field header is usually ONE byte, whose high
+// nibble is the field id DELTA from the previous field and whose low
+// nibble is the type.  A delta of zero means the id did not fit in four
+// bits and a zigzag varint follows.  So a reader must carry the
+// previous field id across the whole struct — and a reader that reset
+// it, or that forgot it inside a nested struct, reads field 7 as field
+// 3 and silently gets a different value of the right type.
+// `PqThriftCursor` carries that state, which is why reading a struct is
+// a value rather than a free function.
+//
+// AND BOOLEANS HAVE NO PAYLOAD.  A `bool` field's VALUE is in its type
+// nibble — `BOOLEAN_TRUE` or `BOOLEAN_FALSE` — so `read_bool` consumes
+// nothing after the header, and a reader that expected a byte is one
+// byte off for the rest of the struct.  Inside a LIST, booleans DO have
+// a payload, because a list header has one element type for all of
+// them.  The two spellings are separate functions here for that reason.
+
+use arrowbuf
+
+// Which thrift wire type a field carries.
+pub enum PqThriftType
+    // A boolean whose value is `true`, carried in the type nibble.
+    PqThriftBoolTrue
+    // A boolean whose value is `false`, likewise.
+    PqThriftBoolFalse
+    PqThriftI8
+    PqThriftI16
+    PqThriftI32
+    PqThriftI64
+    PqThriftDouble
+    // A length-prefixed byte string; a thrift `string` is this too.
+    PqThriftBinary
+    PqThriftList
+    PqThriftSet
+    PqThriftMap
+    PqThriftStruct
+    // The zero byte that ends a struct.
+    PqThriftStop
+
+// A position in the metadata bytes, plus the previous field id a
+// compact-protocol reader has to carry.
+//
+// The field id is state, not a position, and that is the whole reason
+// this is a struct: a free `read_field_header(bytes, at)` cannot know
+// what the previous id was, and a caller that tracked it itself would
+// be reimplementing the one thing this protocol does differently.
+pub struct PqThriftCursor
+    at: Int
+    // The id of the field most recently read in the CURRENT struct.
+    last_field_id: Int
+    // The ids to restore when each nested struct ends.  A stack,
+    // because a nested struct starts its own delta chain at zero and
+    // the parent's resumes after it.
+    stack: [Int]
+
+// One field header.
+pub struct PqThriftField
+    id: Int
+    kind: PqThriftType
+    // Where the field's payload starts.
+    at: Int
+    // For a boolean, its value — already known from the type nibble.
+    bool_value: Bool
+
+// A list header.
+pub struct PqThriftList
+    element: PqThriftType
+    count: Int
+    at: Int
+
+// A cursor at the start of the metadata.
+//
+// ```novo
+// use pqthrift
+//
+// fn main() [io]
+//     let c = pqthrift.cursor(0)
+//     println("${c.at}")
+// ```
+pub fn cursor(at: Int) -> PqThriftCursor
+    todo("parquet-nv.pqthrift.cursor")
+
+// The next field header, or the stop byte.
+//
+// Answers `PqThriftStop` at the end of a struct rather than a fault,
+// because reaching the end of a struct is how every struct is read and
+// a `Result` whose error means "done" is the shape that makes callers
+// swallow real errors.
+pub fn read_field(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, PqThriftField), PqFault>
+    todo("parquet-nv.pqthrift.read_field")
+
+// Enter a nested struct: push the current field id and start a new
+// delta chain.
+pub fn enter_struct(c: PqThriftCursor) -> PqThriftCursor
+    todo("parquet-nv.pqthrift.enter_struct")
+
+// Leave a nested struct: restore the parent's field id.
+pub fn leave_struct(c: PqThriftCursor) -> Result<PqThriftCursor, PqFault>
+    todo("parquet-nv.pqthrift.leave_struct")
+
+// Step over a field of any type without decoding it.
+//
+// THE CALL THAT MAKES FORWARD COMPATIBILITY WORK.  A newer writer adds
+// a field this reader has never heard of; the type says how long it is,
+// so the reader measures it and steps over it.  A reader without this
+// stops at the first unknown field — which is how a file written by a
+// newer Parquet becomes unreadable for no reason.
+pub fn skip_field(src: Bytes, c: PqThriftCursor,
+                  kind: PqThriftType) -> Result<PqThriftCursor, PqFault>
+    todo("parquet-nv.pqthrift.skip_field")
+
+// A zigzag varint as a signed integer.
+//
+// Thrift compact zigzags every signed integer, so `-1` is one byte
+// rather than ten.  A reader that read it as a plain varint answers a
+// large positive number for every negative value — plausible, and
+// wrong.
+pub fn read_zigzag(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Int), PqFault>
+    todo("parquet-nv.pqthrift.read_zigzag")
+
+// An unsigned varint.
+//
+// Lengths and collection sizes are NOT zigzagged, which is the other
+// half of the same mistake.
+pub fn read_varint(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Int), PqFault>
+    todo("parquet-nv.pqthrift.read_varint")
+
+// An `i32` field's value.
+pub fn read_i32(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Int), PqFault>
+    todo("parquet-nv.pqthrift.read_i32")
+
+// An `i64` field's value.
+pub fn read_i64(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Int), PqFault>
+    todo("parquet-nv.pqthrift.read_i64")
+
+// A `double` field's value.  Little-endian, and NOT varint-encoded.
+pub fn read_double(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Float), PqFault>
+    todo("parquet-nv.pqthrift.read_double")
+
+// A binary field, as a SPAN into the caller's bytes.
+//
+// A span and not a copy: a column path segment, a statistic's min and
+// max, and a key-value metadata entry are all binary fields, and a file
+// with ten thousand columns has forty thousand of them.  The caller
+// copies out the handful it keeps.
+pub fn read_binary_span(src: Bytes,
+                        c: PqThriftCursor) -> Result<(PqThriftCursor, arrowbuf.ArrowBuffer), PqFault>
+    todo("parquet-nv.pqthrift.read_binary_span")
+
+// A binary field copied out as a `Str`.
+pub fn read_str(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Str), PqFault>
+    todo("parquet-nv.pqthrift.read_str")
+
+// A boolean field's value.
+//
+// Consumes NOTHING after the header: the value was in the type nibble.
+// See this module's header.
+pub fn read_bool(f: PqThriftField) -> Bool
+    todo("parquet-nv.pqthrift.read_bool")
+
+// A boolean element INSIDE a list, which does have a payload byte.
+pub fn read_list_bool(src: Bytes, c: PqThriftCursor) -> Result<(PqThriftCursor, Bool), PqFault>
+    todo("parquet-nv.pqthrift.read_list_bool")
+
+// A list header.
+//
+// A count of 15 or more moves the count into a following varint, which
+// is the other place a one-byte header stops being one byte.
+pub fn read_list_header(src: Bytes,
+                        c: PqThriftCursor) -> Result<(PqThriftCursor, PqThriftList), PqFault>
+    todo("parquet-nv.pqthrift.read_list_header")
+
+// The wire type a type code names.
+pub fn type_of_code(code: Int) -> Result<PqThriftType, PqFault>
+    todo("parquet-nv.pqthrift.type_of_code")
+
+// The type's name, for a fault report and for a dump.
+pub fn type_name(t: PqThriftType) -> Str
+    todo("parquet-nv.pqthrift.type_name")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// A writer's own field-id state.
+//
+// The mirror of the reader's: a writer that forgot the previous id
+// emits a delta that a reader resolves to the wrong field, and the file
+// is silently wrong rather than refused.
+pub struct PqThriftWriter
+    written: Int
+    last_field_id: Int
+    stack: [Int]
+
+// A writer at the start of a struct.
+pub fn writer() -> PqThriftWriter
+    todo("parquet-nv.pqthrift.writer")
+
+// A field header, using the shortest encoding the id delta allows.
+pub fn write_field(w: PqThriftWriter, id: Int, kind: PqThriftType,
+                   mut dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
+    todo("parquet-nv.pqthrift.write_field")
+
+// The stop byte, and the parent's field id restored.
+pub fn write_stop(w: PqThriftWriter, mut dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
+    todo("parquet-nv.pqthrift.write_stop")
+
+// An unsigned varint.
+pub fn write_varint(value: Int, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqthrift.write_varint")
+
+// A zigzag varint.
+pub fn write_zigzag(value: Int, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqthrift.write_zigzag")
+
+// A length-prefixed binary field payload.
+pub fn write_binary(value: Bytes, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqthrift.write_binary")
+
+// A list header.
+pub fn write_list_header(element: PqThriftType, count: Int, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqthrift.write_list_header")
+
+// How many bytes an unsigned varint of this value takes.
+//
+// Published because every metadata size estimate is a sum of these, and
+// because a writer that guessed five would size a footer buffer twice
+// as large as it needs.
+pub fn varint_len(value: Int) -> Int
+    todo("parquet-nv.pqthrift.varint_len")
+
+// How many bytes the zigzag encoding of this value takes.
+pub fn zigzag_len(value: Int) -> Int
+    todo("parquet-nv.pqthrift.zigzag_len")

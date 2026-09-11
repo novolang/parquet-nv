@@ -1,0 +1,252 @@
+// pqwrite.nv — the writer: pages, chunks, row groups and a footer, into
+// a cursor the caller sized.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A PARQUET WRITER IS A BACKWARD DEPENDENCY IN ONE PLACE, AND THE
+// INTERFACE IS SHAPED BY IT.  A page header carries its payload's
+// COMPRESSED size and is written BEFORE the payload — so the payload's
+// size has to be known before the header exists.  Two ways out: write
+// the payload to a scratch buffer first, or reserve a bounded header
+// and backfill.  This package takes the first, and says so: `PqPageBuf`
+// is the caller's scratch, `page_scratch_bound` sizes it, and the
+// writer never allocates.  Backfilling would mean writing into a cursor
+// behind its own position, which is a shape `Cursor` does not have and
+// which no caller streaming to a socket could use anyway.
+//
+// THE FOOTER IS LAST AND IT NEEDS EVERY OFFSET, so `PqWriter`
+// accumulates them.  That is the one piece of state a Parquet writer
+// genuinely has to carry, it grows with the number of chunks and not
+// with the data, and it is why `finish` is the call that writes both
+// the footer and the closing magic — a file whose footer is missing is
+// a file no reader opens, and a caller that could forget it would.
+//
+// WHAT THIS WRITER CHOOSES, AND WHY EACH CHOICE IS NAMED RATHER THAN
+// DEFAULTED QUIETLY:
+//
+//   v1 data pages          every reader in existence reads them; v2 was
+//                          specified in 2016 and is still refused by
+//                          readers in production.
+//   PLAIN and
+//   RLE_DICTIONARY         the two encodings every reader has, with
+//                          `RLE` for the level streams.  The delta
+//                          encodings are worth writing when the size
+//                          difference is measured on real data, which
+//                          is an implementation's decision.
+//   no SNAPPY              there is no snappy-nv on the registry, so
+//                          this writer's default codec is ZSTD and the
+//                          README says what that costs in
+//                          compatibility: every reader since 2018 has
+//                          ZSTD, and one from before that does not.
+//   statistics written     min, max, null count and distinct count per
+//                          chunk, using the UNSIGNED-ordering fields
+//                          only.  The deprecated signed pair is not
+//                          written at all, because writing bounds that
+//                          a reader may compare two ways is how the
+//                          hazard in `pqmeta`'s header got made.
+//
+// A DICTIONARY IS NOT BUILT HERE.  A caller that wants dictionary
+// encoding supplies the dictionary and the indices; deciding what to
+// intern is a decision about the data, and a format library that made
+// it would be choosing a hash table for its callers.  `dictionary_hint`
+// is the arithmetic that says whether it would have paid.
+
+use arrowbuf
+
+// A caller's scratch buffer for building one page before its header is
+// known.
+//
+// Two cursors rather than one, because a page is built in two stages —
+// the encoded values, then the compressed form of them — and a writer
+// that reused one buffer for both would be compressing in place.
+pub struct PqPageBuf
+    // Where the encoded, uncompressed page is built.
+    raw_len: Int
+    // Where the compressed form goes.
+    packed_len: Int
+
+// The writer.
+pub struct PqWriter
+    schema: PqSchema
+    codec: PqCodec
+    config: PqCodecConfig
+    // Bytes written so far, which every offset in the footer counts
+    // from.
+    written: Int
+    // The row groups closed so far, with their chunks' offsets.
+    row_groups: [PqRowGroup]
+    // The row group being built.
+    open_chunks: [PqColumnChunk]
+    open_rows: Int
+    key_value_metadata: [PqKeyValue]
+    created_by: Str
+    // Whether the opening magic has been written.
+    started: Bool
+
+// A writer for a schema.
+//
+// ```novo
+// use pqwrite
+// use pqcomp
+//
+// fn main() [io]
+//     println("${pqcomp.default_config().zstd_level}")
+// ```
+pub fn writer(s: PqSchema, codec: PqCodec, cfg: PqCodecConfig) -> Result<PqWriter, PqFault>
+    todo("parquet-nv.pqwrite.writer")
+
+// A writer that identifies itself in the footer's `created_by`.
+//
+// Worth setting: several of the reader-side hazards in `pqmeta` are
+// producer-specific, and a file whose producer is anonymous is one a
+// diagnostic tool cannot reason about.
+pub fn with_created_by(w: PqWriter, text: Str) -> PqWriter
+    todo("parquet-nv.pqwrite.with_created_by")
+
+// A writer carrying a custom metadata entry.
+pub fn with_metadata(w: PqWriter, key: Str, value: Str) -> PqWriter
+    todo("parquet-nv.pqwrite.with_metadata")
+
+// ── Sizing, before anything is written ──────────────────────────────
+
+// How large a scratch buffer a page of this many values needs.
+//
+// The bound over the encoding, the level streams and the codec's own
+// worst case — because every codec can GROW incompressible input, and a
+// writer that sized a page buffer at the input's length corrupts on
+// random data.
+pub fn page_scratch_bound(c: PqColumn, count: Int, codec: PqCodec) -> Result<Int, PqFault>
+    todo("parquet-nv.pqwrite.page_scratch_bound")
+
+// An upper bound on the footer for a file with this many row groups and
+// columns.
+//
+// Answerable before the first row group is written, because a caller
+// writing into a preallocated region needs to reserve the tail.
+pub fn footer_bound(s: PqSchema, row_groups: Int) -> Int
+    todo("parquet-nv.pqwrite.footer_bound")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The opening `PAR1`.
+pub fn write_prologue(w: PqWriter, mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_prologue")
+
+// Start a row group.
+pub fn open_row_group(w: PqWriter) -> Result<PqWriter, PqFault>
+    todo("parquet-nv.pqwrite.open_row_group")
+
+// A chunk's dictionary page, from values the caller already interned.
+//
+// First page of the chunk, and the offsets in the footer depend on it
+// being first — so calling this after a data page is refused rather
+// than written in the wrong place.
+pub fn write_dictionary_page(w: PqWriter, c: PqColumn, values: [Bytes], buf: PqPageBuf,
+                             mut scratch: Cursor,
+                             mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_dictionary_page")
+
+// A data page of integer values with their levels.
+//
+// `values` holds only the STORED values — one per slot whose definition
+// level is the maximum — and `definitions` and `repetitions` hold one
+// entry per SLOT.  The two lists have different lengths and that is the
+// format rather than an oversight: a page of a thousand slots in a
+// half-null column carries five hundred values.
+pub fn write_int_page(w: PqWriter, c: PqColumn, values: [Int], definitions: [Int],
+                      repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
+                      mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_int_page")
+
+// A data page of floating-point values.
+pub fn write_float_page(w: PqWriter, c: PqColumn, values: [Float], definitions: [Int],
+                        repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
+                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_float_page")
+
+// A data page of boolean values.
+pub fn write_bool_page(w: PqWriter, c: PqColumn, values: [Bool], definitions: [Int],
+                       repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
+                       mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_bool_page")
+
+// A data page of byte arrays.
+pub fn write_bytes_page(w: PqWriter, c: PqColumn, values: [Bytes], definitions: [Int],
+                        repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
+                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_bytes_page")
+
+// A data page of dictionary indices.
+pub fn write_index_page(w: PqWriter, c: PqColumn, indices: [Int], dictionary_size: Int,
+                        definitions: [Int], repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
+                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.write_index_page")
+
+// Close a column chunk, recording its offsets and statistics.
+pub fn close_chunk(w: PqWriter, c: PqColumn, stats: PqStats,
+                   has_stats: Bool) -> Result<PqWriter, PqFault>
+    todo("parquet-nv.pqwrite.close_chunk")
+
+// Close a row group.
+//
+// Refuses a row group whose chunks are not one per schema leaf, in the
+// leaf order — which is the invariant a reader depends on and the one a
+// writer breaks by forgetting a column that was all null.
+pub fn close_row_group(w: PqWriter, rows: Int) -> Result<PqWriter, PqFault>
+    todo("parquet-nv.pqwrite.close_row_group")
+
+// The footer, its length and the closing `PAR1`.
+//
+// One call, because a file whose footer is missing is a file no reader
+// opens and a caller that could forget it would.
+pub fn finish(w: PqWriter, mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqwrite.finish")
+
+// ── Statistics a writer computes ────────────────────────────────────
+
+// Statistics over a chunk's integer values.
+//
+// Writes the UNSIGNED-ordering fields only.  See this module's header:
+// writing the deprecated signed pair as well is how a reader ends up
+// with two bounds it may compare two different ways.
+pub fn int_stats(values: [Int], null_count: Int) -> PqStats
+    todo("parquet-nv.pqwrite.int_stats")
+
+// Statistics over floating-point values.
+//
+// Omits min and max entirely when any value is NaN, which is what the
+// format says a writer should do and what several do not — and a reader
+// that trusted bounds computed with a NaN in them skips row groups that
+// match.
+pub fn float_stats(values: [Float], null_count: Int) -> PqStats
+    todo("parquet-nv.pqwrite.float_stats")
+
+// Statistics over byte arrays, with the bounds TRUNCATED to `max_len`.
+//
+// A column of long strings would otherwise put two of them in the
+// footer per chunk, and a footer that is megabytes makes opening the
+// file slow for every reader.  Truncation is legal and the format has a
+// rule for it: a truncated MIN is rounded down and a truncated MAX is
+// rounded up, so the bounds still enclose the data, and
+// `is_min_value_exact` says which.  A writer that truncated without
+// rounding produces bounds that EXCLUDE rows in its own file.
+pub fn bytes_stats(values: [Bytes], null_count: Int, max_len: Int) -> PqStats
+    todo("parquet-nv.pqwrite.bytes_stats")
+
+// Whether dictionary encoding would pay for a column's values.
+//
+// The arithmetic, published, rather than a decision this package makes:
+// distinct count against total count, and the index width against the
+// value width.  A caller that wants dictionary encoding builds the
+// dictionary itself — see this module's header — and this is how it
+// decides whether to.
+pub fn dictionary_hint(distinct: Int, total: Int, average_value_bytes: Int) -> Bool
+    todo("parquet-nv.pqwrite.dictionary_hint")
+
+// A scratch buffer's two lengths, reset.
+pub fn page_buf() -> PqPageBuf
+    todo("parquet-nv.pqwrite.page_buf")
+
+// The span within a scratch cursor that a built page occupies.
+pub fn built_span(buf: PqPageBuf) -> arrowbuf.ArrowBuffer
+    todo("parquet-nv.pqwrite.built_span")

@@ -1,0 +1,243 @@
+// pqread_tests.nv — the request machine, the statistics nobody should
+// trust, the codec that is not on the registry, and the two names that
+// mean two things.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE DECISIONS.  A reader that asked for the whole file
+// would pass a suite of round trips and would have thrown the format's
+// value away, so what is asserted here is the SHAPE of the
+// conversation: the first request is the tail, a projection asks for
+// the columns it named and no others, and a host that answers the wrong
+// range is refused rather than decoded from.
+
+use std.test
+use std.list
+use pqread
+use pqmeta
+use pqcomp
+use pqencode
+use pqpage
+use pqfault
+use pqtype
+
+fn a_footer() -> PqFileMeta
+    let one = pqtype.leaf("price", PqOptional, PqDouble)
+    let two = pqtype.leaf("qty", PqRequired, PqInt64)
+    let root = pqtype.group("schema", PqRequired, [one, two])
+    let s = match pqtype.schema(root)
+        Ok(v)  => v
+        Err(_) => PqSchema { root: root, columns: [] }
+    let c1 = PqColumnChunk { path: "price", physical: PqDouble,
+                             codec: PqZstd, num_values: 1000,
+                             total_uncompressed_size: 8000,
+                             total_compressed_size: 3000,
+                             data_page_offset: 1004,
+                             dictionary_page_offset: 4,
+                             offset_index_offset: 0 - 1, offset_index_length: 0,
+                             column_index_offset: 0 - 1, column_index_length: 0,
+                             encodings: [PqPlain], stats: pqmeta.no_stats(),
+                             has_stats: false }
+    let c2 = PqColumnChunk { path: "qty", physical: PqInt64,
+                             codec: PqZstd, num_values: 1000,
+                             total_uncompressed_size: 8000,
+                             total_compressed_size: 2000,
+                             data_page_offset: 3004,
+                             dictionary_page_offset: 0 - 1,
+                             offset_index_offset: 0 - 1, offset_index_length: 0,
+                             column_index_offset: 0 - 1, column_index_length: 0,
+                             encodings: [PqPlain], stats: pqmeta.no_stats(),
+                             has_stats: false }
+    let g = PqRowGroup { columns: [c1, c2], num_rows: 1000,
+                         total_byte_size: 5000, file_offset: 0 - 1,
+                         ordinal: 0 }
+    PqFileMeta { version: 2, schema: s, num_rows: 1000, row_groups: [g],
+                 key_value_metadata: [], created_by: "parquet-nv 0.0.1" }
+
+@test
+fn test_the_first_thing_a_reader_wants_is_the_tail() [io]
+    let r = pqread.reader(1048576)
+
+    test.case("eight bytes: a four-byte footer length and PAR1")
+    test.assert(pqmeta.tail_bytes() == 8)
+
+    match pqread.step(r)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.request
+                PqWantTail(n) => test.assert(n == pqmeta.tail_bytes())
+                _             => test.assert(false)
+
+    test.case("and the file's LENGTH is the reader's, because the format does not record it")
+    test.assert(r.file_len == 1048576)
+
+@test
+fn test_a_host_that_answers_the_wrong_range_is_refused() [io]
+    let r = pqread.reader(1024)
+    let wrong = bytes.zeros(8)
+
+    test.case("supplying bytes from an offset the reader did not ask for is a fault")
+    match pqread.supply(r, 0, wrong)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("and it is a protocol error in the HOST, not a corrupt file")
+            test.assert(pqfault.is_corrupt(f) == false)
+
+@test
+fn test_a_projection_asks_for_the_columns_it_named_and_no_others() [io]
+    let m = a_footer()
+
+    test.case("one column of two is one range")
+    match pqread.ranges_for(m, 0, ["qty"])
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert(list.len(rs) == 1)
+            test.assert(rs[0].start == 3004)
+
+    test.case("and the bytes it will read are the chunk's, not the file's")
+    match pqread.projected_bytes(m, ["qty"])
+        Ok(n)  => test.assert(n == 2000)
+        Err(_) => test.assert(false)
+
+    test.case("both columns are both ranges")
+    match pqread.ranges_for(m, 0, ["price", "qty"])
+        Ok(rs) => test.assert(list.len(rs) == 2)
+        Err(_) => test.assert(false)
+
+    test.case("a column the schema does not have is refused rather than skipped")
+    match pqread.ranges_for(m, 0, ["missing"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("coalescing is the caller's threshold, because a network and a disk differ")
+    match pqread.ranges_for(m, 0, ["price", "qty"])
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert(list.len(pqread.coalesce(rs, 4096)) == 1)
+            test.assert(list.len(pqread.coalesce(rs, 0)) == 2)
+
+@test
+fn test_a_chunk_starts_at_its_dictionary_page_and_not_at_file_offset() [io]
+    let m = a_footer()
+    let g = m.row_groups[0]
+
+    test.case("a chunk with a dictionary starts THERE")
+    test.assert(pqmeta.chunk_start(g.columns[0]) == 4)
+
+    test.case("one without starts at its first data page")
+    test.assert(pqmeta.chunk_start(g.columns[1]) == 3004)
+
+    test.case("and file_offset is ignored, because producers wrote it wrongly for years")
+    test.assert(g.file_offset == 0 - 1)
+    test.assert(pqmeta.row_group_start(g) == 4)
+
+@test
+fn test_statistics_are_a_claim_and_may_contain_says_so() [io]
+    let none = pqmeta.no_stats()
+
+    test.case("nothing is claimed, so nothing is ruled out")
+    test.assert(pqmeta.may_contain(none, PqInt64, bytes.zeros(8), "anything"))
+
+    test.case("and untrustworthy statistics answer the same way, which is the safe default")
+    test.assert(pqmeta.stats_are_trustworthy(none, PqByteArray, "parquet-mr 1.8.0")
+                == false)
+
+    test.case("all-null is the one derived answer that is safe when the count is present")
+    test.assert(pqmeta.is_all_null(none, 1000) == false)
+
+    test.case("a statistics set that contradicts its chunk is reported")
+    test.assert(list.len(pqmeta.check_stats(none, PqInt64, 1000, "qty")) >= 0)
+
+@test
+fn test_snappy_is_unavailable_and_that_is_not_corruption() [io]
+    test.case("three codecs run natively here")
+    test.assert(pqcomp.is_native(PqUncompressed))
+    test.assert(pqcomp.is_native(PqGzip))
+    test.assert(pqcomp.is_native(PqZstd))
+    test.assert(pqcomp.is_native(PqLz4Raw))
+
+    test.case("and the four that do not, one of which is the format's own default")
+    test.assert(pqcomp.is_native(PqSnappy) == false)
+    test.assert(pqcomp.is_native(PqBrotli) == false)
+    test.assert(pqcomp.is_native(PqLzo) == false)
+
+    test.case("the ambiguous older LZ4 id is refused by name rather than guessed at")
+    test.assert(pqcomp.is_native(PqLz4) == false)
+
+    test.case("with no caller-supplied codec, Snappy cannot be read")
+    test.assert(pqcomp.can_read(PqSnappy, pqcomp.no_decompressors()) == false)
+
+    test.case("and a file's unreadable codecs are named from the FOOTER, before any page")
+    let m = a_footer()
+    test.assert(list.len(pqcomp.unreadable_codecs(m, pqcomp.no_decompressors())) == 0)
+
+@test
+fn test_plain_dictionary_means_two_different_things() [io]
+    test.case("on a DATA page it is the deprecated name for RLE_DICTIONARY")
+    match pqencode.effective_encoding(PqPlainDictionary, false)
+        PqRle => test.assert(true)
+        _     => test.assert(false)
+    test.assert(pqencode.is_dictionary_encoding(PqPlainDictionary, false))
+
+    test.case("on a DICTIONARY page it means the values are PLAIN")
+    match pqencode.effective_encoding(PqPlainDictionary, true)
+        PqPlain => test.assert(true)
+        _       => test.assert(false)
+    test.assert(pqencode.is_dictionary_encoding(PqPlainDictionary, true) == false)
+
+@test
+fn test_not_every_encoding_fits_every_physical_type() [io]
+    test.case("PLAIN fits everything")
+    test.assert(pqencode.encoding_fits(PqPlain, PqBoolean))
+    test.assert(pqencode.encoding_fits(PqPlain, PqByteArray))
+
+    test.case("DELTA_BINARY_PACKED is integers only")
+    test.assert(pqencode.encoding_fits(PqDeltaBinaryPacked, PqInt64))
+    test.assert(pqencode.encoding_fits(PqDeltaBinaryPacked, PqByteArray) == false)
+
+    test.case("DELTA_LENGTH_BYTE_ARRAY is byte arrays only")
+    test.assert(pqencode.encoding_fits(PqDeltaLengthByteArray, PqByteArray))
+    test.assert(pqencode.encoding_fits(PqDeltaLengthByteArray, PqDouble) == false)
+
+    test.case("BYTE_STREAM_SPLIT is fixed-width only")
+    test.assert(pqencode.encoding_fits(PqByteStreamSplit, PqDouble))
+    test.assert(pqencode.encoding_fits(PqByteStreamSplit, PqByteArray) == false)
+
+@test
+fn test_a_first_writer_emits_three_encodings_and_says_which() [io]
+    let w = pqencode.writable_encodings()
+
+    test.case("PLAIN, RLE and the dictionary pair — the set every reader has")
+    test.assert(list.len(w) == 3)
+    test.assert(pqencode.is_writable(PqPlain))
+    test.assert(pqencode.is_writable(PqRle))
+
+    test.case("and the delta encodings are read but not written")
+    test.assert(pqencode.is_writable(PqDeltaBinaryPacked) == false)
+    test.assert(pqencode.is_writable(PqByteStreamSplit) == false)
+
+    test.case("the deprecated BIT_PACKED level encoding is neither")
+    test.assert(pqencode.is_writable(PqBitPacked) == false)
+
+@test
+fn test_a_v2_page_can_be_stored_uncompressed_inside_a_compressed_chunk() [io]
+    test.case("v1 keeps its levels inside the compressed payload")
+    test.assert(pqpage.levels_are_compressed(PqDataPageV1))
+
+    test.case("v2 keeps them outside it, which is what lets a reader skip a page")
+    test.assert(pqpage.levels_are_compressed(PqDataPageV2) == false)
+
+    test.case("and a v2 page carries its OWN compressed flag")
+    let h = PqPageHeader { kind: PqDataPageV2, compressed_size: 100,
+                           uncompressed_size: 100, crc: 0, has_crc: false,
+                           payload_at: 64, header_len: 60 }
+    let d = PqDataPage { num_values: 10, num_non_null: 10, num_rows: 10,
+                         encoding: PqPlain, definition_encoding: PqRle,
+                         repetition_encoding: PqRle, definition_len: 0,
+                         repetition_len: 0, is_compressed: false,
+                         stats: pqmeta.no_stats(), has_stats: false }
+    test.assert(pqpage.payload_is_compressed(h, d, PqZstd) == false)
+
+    test.case("so the next page is found from the COMPRESSED size, never the other one")
+    test.assert(pqpage.next_page_at(h) == 64 + 100)

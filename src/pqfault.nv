@@ -1,0 +1,219 @@
+// pqfault.nv — why a file, a page or a write was refused, and where.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A PARQUET FAULT NAMES A COLUMN PATH, NOT A BYTE.  A file is a footer,
+// a tree of row groups and a few thousand pages, and "byte 4 194 304 is
+// not a valid varint" tells nobody anything.  `PqWhere` carries the row
+// group, the column's DOTTED PATH, the page ordinal and the byte
+// offset, because the path is what a person can act on: `orders.items.
+// price, row group 3, data page 11` names a place in somebody's data.
+//
+// THREE KINDS, AND A CALLER REACTS TO THEM DIFFERENTLY:
+//
+//   INCOMPLETE   — the range the reader asked for did not arrive whole.
+//                  A range reader answers this by asking again, which
+//                  is normal over a network.
+//   CORRUPT      — the bytes contradict the format.
+//   UNAVAILABLE  — the file is valid Parquet this build cannot read: a
+//                  codec that is not on the registry, an encoding that
+//                  is deprecated, a version newer than this reader.  A
+//                  separate kind, because a caller that treats an
+//                  unavailable codec as corruption reports a bug
+//                  against a file that is fine.
+
+// Where in a file a fault was found.
+pub struct PqWhere
+    // Which row group, or `-1` for a fault in the footer itself.
+    row_group: Int
+    // The column's dotted path — `orders.items.price`.  Empty for a
+    // fault that is not about a column.
+    path: Str
+    // Which page within the column chunk, counting data pages from
+    // zero, or `-1`.
+    page: Int
+    // Byte offset from the start of the file, or `-1`.
+    at: Int
+
+// A position in the footer, where there is no column yet.
+pub fn in_footer(at: Int) -> PqWhere
+    todo("parquet-nv.pqfault.in_footer")
+
+// A position naming a column chunk.
+pub fn in_chunk(row_group: Int, path: Str, at: Int) -> PqWhere
+    todo("parquet-nv.pqfault.in_chunk")
+
+// A position naming one page of one column chunk.
+pub fn in_page(row_group: Int, path: Str, page: Int, at: Int) -> PqWhere
+    todo("parquet-nv.pqfault.in_page")
+
+// The position for a value the caller built rather than read.
+pub fn no_where() -> PqWhere
+    todo("parquet-nv.pqfault.no_where")
+
+// Which of the three kinds a fault is.
+pub enum PqFaultKind
+    PqIncomplete
+    PqCorrupt
+    PqUnavailable
+
+// Why a file, a page or a write was refused.
+pub enum PqFault
+    // The four bytes at both ends of a Parquet file are `PAR1`.  A file
+    // whose head says `PAR1` and whose tail does not is a truncated
+    // upload, which is the common case and worth telling apart.
+    PqBadMagic(at_head: Bool, at: PqWhere)
+    // The file is shorter than the eight bytes a footer length and a
+    // magic need.
+    PqTooShort(len: Int, at: PqWhere)
+    // The footer length in the last eight bytes points outside the
+    // file.
+    PqFooterOutOfRange(footer_len: Int, file_len: Int, at: PqWhere)
+    // A range the reader asked for came back short.
+    PqRangeShort(want: Int, got: Int, at: PqWhere)
+    // The caller answered a request with a range the reader did not
+    // ask for.  A protocol error in the host, and worth its own
+    // variant: silently accepting it would decode the wrong bytes.
+    PqRangeMismatch(want_at: Int, got_at: Int, at: PqWhere)
+    // A thrift field header whose type code is not one this subset
+    // reads.
+    PqThriftBadType(code: Int, at: PqWhere)
+    // A thrift varint that does not terminate within ten bytes.
+    PqThriftBadVarint(at: PqWhere)
+    // A thrift struct that ends before a field the schema requires.
+    PqThriftMissingField(struct_name: Str, field: Int, at: PqWhere)
+    // A thrift list or binary whose declared length runs past the
+    // buffer.  The fault a fuzzer finds first, and the reason every
+    // length is checked against the remaining bytes before it is used.
+    PqThriftLengthPastEnd(want: Int, have: Int, at: PqWhere)
+    // A format version this reader does not read.  1 and 2 are read.
+    PqVersionUnsupported(version: Int, at: PqWhere)
+    // A physical type code that is not in the format.
+    PqUnknownPhysicalType(code: Int, at: PqWhere)
+    // A converted or logical type this reader does not map.
+    PqUnknownLogicalType(name: Str, at: PqWhere)
+    // A schema whose flattened leaves do not match the column chunks
+    // the row group carries.  The check that catches a writer whose
+    // pre-order walk differs from this one.
+    PqSchemaColumnMismatch(want: Int, got: Int, at: PqWhere)
+    // A schema element whose repetition type is illegal where it sits —
+    // a repeated root, a required child of an optional group inside a
+    // LIST that the annotation says is a two-level encoding.
+    PqBadRepetition(path: Str, at: PqWhere)
+    // A definition or repetition level past the maximum the schema
+    // allows.  A level stream that says "null at depth 4" for a column
+    // three deep is corruption that a decoder which clamped would turn
+    // into wrong values.
+    PqLevelOutOfRange(level: Int, max: Int, at: PqWhere)
+    // A repetition level stream whose first value is not zero.  Every
+    // record starts at repetition level zero by definition, and a page
+    // that does not is a page whose record boundaries cannot be found.
+    PqFirstRepetitionNotZero(saw: Int, at: PqWhere)
+    // An encoding code that is not in the format.
+    PqUnknownEncoding(code: Int, at: PqWhere)
+    // An encoding that IS in the format and is not read here — the
+    // deprecated `BIT_PACKED` and `PLAIN_DICTIONARY` level encodings,
+    // and `DELTA_BYTE_ARRAY`'s incremental form where a writer emitted
+    // it for a non-string column.
+    PqEncodingUnsupported(name: Str, at: PqWhere)
+    // A data page that names a dictionary and the chunk has none.
+    PqDictionaryMissing(at: PqWhere)
+    // A dictionary index past the dictionary's size.
+    PqDictionaryIndexOutOfRange(index: Int, size: Int, at: PqWhere)
+    // A compression codec this build cannot run — SNAPPY and BROTLI
+    // have no package on the registry, LZO is abandoned.  UNAVAILABLE,
+    // not corrupt: the file is fine.
+    PqCodecUnavailable(name: Str, at: PqWhere)
+    // A codec that ran and produced fewer bytes than the page header
+    // declared.
+    PqDecompressedSizeWrong(want: Int, got: Int, at: PqWhere)
+    // A page whose uncompressed size is past the caller's budget.  The
+    // number crosses the interface before anything is allocated, the
+    // same way zstd-nv's window limit does.
+    PqPageTooLarge(want: Int, limit: Int, at: PqWhere)
+    // A value count that does not agree between a page header, its
+    // level streams and its values.
+    PqValueCountWrong(want: Int, got: Int, at: PqWhere)
+    // A `FIXED_LEN_BYTE_ARRAY` whose type length is not positive, or a
+    // decimal whose precision cannot fit its byte width.
+    PqBadTypeLength(len: Int, at: PqWhere)
+    // A decimal whose scale is outside `[0, precision]`.
+    PqBadDecimal(precision: Int, scale: Int, at: PqWhere)
+    // Two columns of one schema with the same dotted path.  The format
+    // permits it and every reader that resolves a column by name breaks
+    // on it.
+    PqDuplicatePath(path: Str, at: PqWhere)
+    // Statistics that contradict the data or themselves — a min above a
+    // a max, a null count past the value count.  Reported rather than
+    // trusted: `PqStats` carries a producer's CLAIM.
+    PqBadStatistics(path: Str, at: PqWhere)
+    // The destination cursor has less room than the write needs.
+    // Nothing is written when this is answered.
+    PqWriteBufferTooSmall(want: Int, have: Int, at: PqWhere)
+    // A caller asked for a column the schema does not have.
+    PqNoSuchColumn(path: Str, at: PqWhere)
+    // A caller asked for a row group the file does not have.
+    PqNoSuchRowGroup(index: Int, count: Int, at: PqWhere)
+
+// The standard `Error` implementation, so a refused file is reported by
+// anything that reports errors.
+//
+// ```novo
+// use pqfault
+//
+// fn main() [io]
+//     let f = pqfault.too_short(3)
+//     println(f.message())
+// ```
+impl Error for PqFault
+    // The one-line report: what was wrong, and the column path.  The
+    // path is the half a person acts on — a byte offset into a file
+    // nobody has a dump of is not actionable, and `orders.items.price`
+    // is.
+    fn message(self) -> Str
+        todo("parquet-nv.pqfault.PqFault.message")
+
+// A file too short to hold a footer, built.
+//
+// The first refusal any reader can make — eight bytes is the minimum a
+// Parquet file can be and still name its own footer — and the one a
+// truncated upload produces.
+pub fn too_short(len: Int) -> PqFault
+    todo("parquet-nv.pqfault.too_short")
+
+// Which of the three kinds this fault is.
+pub fn kind_of(f: PqFault) -> PqFaultKind
+    todo("parquet-nv.pqfault.kind_of")
+
+// Whether more bytes could still make this succeed.
+pub fn is_incomplete(f: PqFault) -> Bool
+    todo("parquet-nv.pqfault.is_incomplete")
+
+// Whether the bytes contradict the format.
+pub fn is_corrupt(f: PqFault) -> Bool
+    todo("parquet-nv.pqfault.is_corrupt")
+
+// Whether the file is fine and this build cannot read it.
+//
+// The question a caller asks before it reports a bug against somebody
+// else's writer.
+pub fn is_unavailable(f: PqFault) -> Bool
+    todo("parquet-nv.pqfault.is_unavailable")
+
+// Where the fault was found.
+pub fn where_of(f: PqFault) -> PqWhere
+    todo("parquet-nv.pqfault.where_of")
+
+// The position as one line, with the absent coordinates left out rather
+// than printed as `-1`.
+pub fn where_text(w: PqWhere) -> Str
+    todo("parquet-nv.pqfault.where_text")
+
+// The kind's name, for a log line that groups faults.
+pub fn kind_name(k: PqFaultKind) -> Str
+    todo("parquet-nv.pqfault.kind_name")
+
+// A fault re-pointed at a column, for a caller that caught one from a
+// page decoder that did not know which column it was decoding.
+pub fn in_column(f: PqFault, row_group: Int, path: Str) -> PqFault
+    todo("parquet-nv.pqfault.in_column")

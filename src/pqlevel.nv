@@ -1,0 +1,213 @@
+// pqlevel.nv — definition and repetition levels: how Parquet stores a
+// null three levels deep, and a list of lists, in two integer streams
+// beside the values.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE PART OF PARQUET THAT IS NOT OBVIOUS, so it gets its own
+// module and its own argument.  A column chunk stores only the LEAF
+// VALUES that actually exist — no placeholders for nulls, no structure
+// — plus two streams of small integers per value slot:
+//
+//   DEFINITION LEVEL   how deep the value is DEFINED.  At the maximum,
+//                      the value is present and a value was stored.
+//                      Below it, the value is absent and the number
+//                      says WHICH ancestor was null or empty.
+//   REPETITION LEVEL   at which depth this value CONTINUES a repeated
+//                      ancestor.  Zero starts a new record; `k` means
+//                      "a new element of the k-th repeated ancestor".
+//
+// So a column `a.b.c` where `a` is optional, `b` is a repeated group
+// and `c` is optional has max definition 3 and max repetition 1, and
+// four different things are spelled by four definition levels: `a` is
+// null (0), `a` is present and `b` is empty (1), `b` has an element and
+// `c` is null (2), `c` has a value (3).  ONE integer distinguishes
+// "the list is null", "the list is empty" and "the list has one null
+// element" — which is the distinction every flat representation loses
+// and the reason this format can round-trip nested data at all.
+//
+// **A RECORD BOUNDARY IS A REPETITION LEVEL OF ZERO, AND NOTHING ELSE
+// MARKS ONE.** `record_starts` is therefore the load-bearing call of
+// this module: a reader assembling rows counts zeros, and a page whose
+// first repetition level is not zero is a page whose boundaries cannot
+// be found — which is `PqFirstRepetitionNotZero` rather than something
+// to work around.
+//
+// TWO THINGS THAT LOOK LIKE OPTIMISATIONS AND ARE THE FORMAT:
+//
+//   - A column whose maximum level is ZERO omits that stream ENTIRELY.
+//     A required, non-nested column has neither stream, and a reader
+//     that expected a zero-length stream and read four bytes of length
+//     is four bytes into the values.  `stream_is_present` is the check.
+//   - The bit width of a level is `ceil(log2(max + 1))`, so a maximum
+//     of 3 packs two bits per value.  `bit_width` is that arithmetic,
+//     and it is what the RLE/bit-packed hybrid decoder is parameterised
+//     by.
+
+use arrowbuf
+
+// The two level streams of one page, as spans into the page's own
+// decompressed bytes.
+//
+// Spans rather than decoded lists, because a projection that only needs
+// to COUNT rows reads the repetition stream and never touches the
+// values, and a page with a million values would otherwise allocate two
+// million-element lists to answer it.
+pub struct PqLevels
+    definition: arrowbuf.ArrowBuffer
+    repetition: arrowbuf.ArrowBuffer
+    has_definition: Bool
+    has_repetition: Bool
+    max_definition: Int
+    max_repetition: Int
+    // How many level entries there are — the page's value slot count,
+    // which is NOT the number of stored values.
+    count: Int
+
+// How many bits one level of this maximum occupies.
+//
+// `ceil(log2(max + 1))`, and zero for a maximum of zero.  The parameter
+// the RLE/bit-packed hybrid decoder takes, and the number that makes a
+// three-deep nullable column cost two bits per slot rather than a byte.
+//
+// ```novo
+// use pqlevel
+//
+// fn main() [io]
+//     println("${pqlevel.bit_width(3)}")
+// ```
+pub fn bit_width(max_level: Int) -> Int
+    todo("parquet-nv.pqlevel.bit_width")
+
+// Whether a level stream is present at all for this maximum.
+//
+// False when the maximum is zero, and that means the stream is ABSENT
+// rather than empty — no length prefix, no bytes.  The check that keeps
+// a reader of a flat required column from consuming four bytes of
+// values as a length.
+pub fn stream_is_present(max_level: Int) -> Bool
+    todo("parquet-nv.pqlevel.stream_is_present")
+
+// The levels of a v1 data page, located within its decompressed bytes.
+//
+// In a v1 page the two streams are INSIDE the compressed payload, each
+// with a four-byte length prefix, repetition first.  In a v2 page they
+// are outside it and their lengths are in the header — which is the
+// main reason the two page versions are read by different code, and why
+// this takes the version rather than guessing.
+pub fn levels_of_v1(page: Bytes, at: Int, c: PqColumn, count: Int) -> Result<PqLevels, PqFault>
+    todo("parquet-nv.pqlevel.levels_of_v1")
+
+// The levels of a v2 data page, whose streams are uncompressed and
+// whose lengths the header gave.
+pub fn levels_of_v2(page: Bytes, at: Int, definition_len: Int, repetition_len: Int, c: PqColumn,
+                    count: Int) -> Result<PqLevels, PqFault>
+    todo("parquet-nv.pqlevel.levels_of_v2")
+
+// The definition level at a slot.
+pub fn definition_at(page: Bytes, l: PqLevels, i: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.definition_at")
+
+// The repetition level at a slot.
+pub fn repetition_at(page: Bytes, l: PqLevels, i: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.repetition_at")
+
+// Every definition level of a page, decoded.
+//
+// The materialising call, for a caller that is about to walk the whole
+// page anyway.  `definition_at` is the one for a caller that is not.
+pub fn definitions(page: Bytes, l: PqLevels) -> Result<[Int], PqFault>
+    todo("parquet-nv.pqlevel.definitions")
+
+// Every repetition level of a page, decoded.
+pub fn repetitions(page: Bytes, l: PqLevels) -> Result<[Int], PqFault>
+    todo("parquet-nv.pqlevel.repetitions")
+
+// Whether the slot at `i` has a stored value.
+//
+// True exactly when its definition level is the maximum.  The single
+// most-used question in a decoder, and the one that says how many
+// values a page really stores: `stored_count` is this, counted.
+pub fn is_stored(page: Bytes, l: PqLevels, i: Int) -> Result<Bool, PqFault>
+    todo("parquet-nv.pqlevel.is_stored")
+
+// How many of a page's slots have a stored value.
+//
+// NOT the page's value count: a page of a thousand slots in a column
+// that is half null stores five hundred values, and a decoder that
+// asked the values buffer for a thousand reads past its end.
+pub fn stored_count(page: Bytes, l: PqLevels) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.stored_count")
+
+// **The slots at which a new record begins.**
+//
+// Every index whose repetition level is zero.  THE LOAD-BEARING CALL OF
+// THIS MODULE: nothing else in a Parquet file marks a record boundary,
+// and a reader assembling rows counts these.  A page whose first
+// repetition level is not zero is refused rather than assembled from,
+// because its boundaries cannot be recovered.
+pub fn record_starts(page: Bytes, l: PqLevels) -> Result<[Int], PqFault>
+    todo("parquet-nv.pqlevel.record_starts")
+
+// How many records a page's slots cover.
+//
+// What a reader needs to know whether a page completes the row group's
+// row count — and what a page header's `num_values` does NOT say, since
+// that counts slots.
+pub fn record_count(page: Bytes, l: PqLevels) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.record_count")
+
+// At which ancestor the value at a slot is absent.
+//
+// The depth from the root at which the path stopped: `max` means
+// present, and anything less names the level where a null or an empty
+// repeated group was.  What turns a definition level back into "the
+// list was null" versus "the list was empty" versus "the element was
+// null" — three different facts one number distinguishes, and the whole
+// reason the level is not a boolean.
+pub fn absent_at_depth(page: Bytes, l: PqLevels, i: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.absent_at_depth")
+
+// Whether a definition level means "an empty repeated group" rather
+// than "a null".
+//
+// Distinguishable only against the SCHEMA PATH, because it depends on
+// whether the ancestor at that depth is optional or repeated — which is
+// why this takes the column and a bare level comparison cannot answer
+// it.
+pub fn is_empty_list_level(c: PqColumn, path: [PqSchemaElement], level: Int) -> Bool
+    todo("parquet-nv.pqlevel.is_empty_list_level")
+
+// Every way a level stream contradicts its column or itself — a level
+// past the maximum, a first repetition level that is not zero, a count
+// that does not match the header.
+pub fn check_levels(page: Bytes, l: PqLevels, c: PqColumn) -> [PqFault]
+    todo("parquet-nv.pqlevel.check_levels")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The levels for a flat, required column — neither stream.
+//
+// Published because it is the common case and because writing it as an
+// empty stream rather than no stream is the mistake this module's
+// header names.
+pub fn flat_levels(count: Int) -> PqLevels
+    todo("parquet-nv.pqlevel.flat_levels")
+
+// A definition stream, written into a cursor with the RLE/bit-packed
+// hybrid encoding at the column's own bit width.
+pub fn write_definitions(levels: [Int], c: PqColumn, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.write_definitions")
+
+// A repetition stream, likewise.
+pub fn write_repetitions(levels: [Int], c: PqColumn, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqlevel.write_repetitions")
+
+// An upper bound on the bytes a level stream of this many entries
+// needs.
+//
+// The sizing a writer does before it starts, since the encoding's size
+// depends on the run structure and a caller allocating a page buffer
+// needs a number first.
+pub fn level_bound(count: Int, max_level: Int) -> Int
+    todo("parquet-nv.pqlevel.level_bound")

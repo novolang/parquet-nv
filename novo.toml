@@ -1,0 +1,93 @@
+[package]
+name        = "parquet-nv"
+version     = "0.0.1"
+description = "The Apache Parquet file format over arrow-nv: the footer and its thrift-compact subset, row groups, column chunks, pages with every encoding, definition and repetition levels for nested data, statistics, and page compression through the published codecs.  The reader ASKS for byte ranges and the host answers them, so a projection never reads the columns it did not name.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  Parquet is arithmetic over bytes: the reader is a state
+# machine that ANSWERS with the byte ranges it wants next and the host
+# is the only party that opens anything, and the writer fills a
+# `Cursor` the caller sized.  Nothing here reads a file, a clock or a
+# socket.
+#
+# No `@tier(embedded)` claim, and none is intended.  A file footer is a
+# tree of boxed structs with a string per column path, a row group is a
+# growable list, and a device that reads one column of one Parquet file
+# is not a consumer anybody has asked for.  The audit's `core-embedded`
+# row passes as "makes no device claim".
+layer       = "core"
+
+category    = "science"
+
+tags        = ["parquet", "columnar", "thrift", "row-group", "dictionary-encoding", "statistics", "arrow", "sans-io"]
+repository  = "https://github.com/novolang/parquet-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The reader asks for byte ranges; the host answers them"
+
+[dependencies]
+# arrow-nv, FOR THE VALUES A DECODED COLUMN BECOMES.
+#
+# The plan's row is "parquet-nv, with arrow-nv", and the reason is that
+# the two formats are the same data in two shapes: Parquet is how a
+# column is STORED and Arrow is how it is HELD.  A Parquet reader that
+# invented its own in-memory column would be publishing a third shape
+# nobody else reads, and every consumer would convert twice.
+#
+# So `pqarrow` decodes a column chunk straight into an `ArrowArray` over
+# a body the caller owns, and the type mapping is a published function
+# rather than a table in a comment.  `core`, so `dep-layer` holds.
+#
+# A SIBLING PATH DEPENDENCY while both are staged in this tree.  A
+# published package depends on published packages, so this becomes
+# `arrow-nv = "^0.0.1"` before the first publish — which `novo pkg
+# publish` refuses to do for us, by design, and says so at this line.
+arrow-nv = "^0.0.1"
+
+# flate-nv, FOR THE `GZIP` PAGE COMPRESSION.
+#
+# Parquet's `GZIP` codec is a gzip stream per page, which is
+# `inflate.decompress(page, GzipWrapped)` and nothing else.  `core`.
+flate-nv = "^0.0.2"
+
+# zstd-nv, FOR THE `ZSTD` PAGE COMPRESSION.
+#
+# A zstd frame per page.  The codec most modern writers default to, and
+# the one whose window limit has to cross an interface before anything
+# is allocated — which zstd-nv already makes the caller state, so
+# `pqcomp` passes the caller's budget straight through.
+zstd-nv = "^0.0.1"
+
+# lz4-nv, FOR THE `LZ4_RAW` PAGE COMPRESSION.
+#
+# `LZ4_RAW` is the BLOCK format, not the frame format — which is why
+# this is `lz4block.decompress` and not `lz4read`.  The older `LZ4`
+# codec id is a different, ambiguous thing that two implementations
+# disagreed about; `pqcomp` refuses it by name rather than guessing.
+lz4-nv = "^0.0.1"
+
+# DELIBERATELY ABSENT, and each one is a row rather than a shortcoming:
+#
+#   SNAPPY — the codec the majority of Parquet files in the world use,
+#     and the DEFAULT of the reference writers.  There is no snappy-nv
+#     on the registry.  `pqcomp` names the codec, answers
+#     `PqCodecUnavailable` for it, and takes the decompressor as a pair
+#     of NAMED FUNCTIONS the caller supplies so a program that has one
+#     can still read those files.  **This lane's report asks for a
+#     `snappy-nv` row on the grid**; it is the single largest gap
+#     between this package and a reader that opens an arbitrary file.
+#   BROTLI — brotli-nv is a planned row (P2) and is not published.  Same
+#     treatment.
+#   LZO — an abandoned codec id.  Refused by name.

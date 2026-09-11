@@ -1,0 +1,236 @@
+// pqarrow.nv — the bridge: a Parquet column chunk as an Arrow array,
+// and an Arrow schema as a Parquet one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE TWO FORMATS ARE THE SAME DATA IN TWO SHAPES: Parquet is how a
+// column is STORED and Arrow is how it is HELD.  So this package decodes
+// into `ArrowArray` rather than inventing a third in-memory column that
+// nobody else reads — which is what the plan's "parquet-nv, with
+// arrow-nv" means and why arrow-nv is the one structural dependency.
+//
+// **THE MAPPING IS NOT A BIJECTION, AND EVERY GAP IS NAMED.**  Three
+// kinds of mismatch, and each one has a function rather than a comment:
+//
+//   PARQUET HAS NO EQUIVALENT.  Arrow's unions, its `Null` type, its
+//     interval types and its dictionary-of-anything have no Parquet
+//     spelling.  `parquet_type_of` refuses them by name.
+//   ARROW HAS NO EQUIVALENT.  `INT96` is a deprecated 96-bit timestamp
+//     with no Arrow type at all; it is read as `Timestamp(Nano, "")` and
+//     `int96_is_lossy` says when that loses range, which it does for
+//     dates before 1677 and after 2262.
+//   THE SHAPES DISAGREE.  Parquet's nesting is repetition levels and
+//     Arrow's is offsets buffers, and the translation is the real work
+//     of this module.  A Parquet `LIST` is three schema levels and an
+//     Arrow list is one field with one child, so `arrow_field_of` and
+//     `parquet_group_of` are not inverses at the element level even
+//     though they round-trip at the value level.
+//
+// **LEVELS BECOME OFFSETS, AND THAT IS THE WHOLE CONVERSION.**  Parquet
+// stores, per value slot, how deep it is defined and where it repeats;
+// Arrow stores, per list element, where its children start.  Going one
+// way is a scan that turns a run of repetition levels into an offsets
+// entry; going the other is a walk that turns an offsets pair into a
+// run of levels.  `levels_to_offsets` and `offsets_to_levels` are those
+// two, they are where a nested conversion is right or wrong, and they
+// are published separately from the column readers so a reader can test
+// them against the specification's own example.
+//
+// THE ARROW SCHEMA IN THE FOOTER IS THE OTHER HALF OF THE ROUND TRIP.
+// A file written by an Arrow writer carries its original Arrow schema,
+// base64-encoded, under the `ARROW:schema` key — because Parquet cannot
+// express, say, a dictionary-encoded field's index type, or an Arrow
+// extension type.  `arrow_schema_key` names it and
+// `has_arrow_schema` asks; decoding it is
+// `arrowipc.read_schema` over the decoded bytes, and this package does
+// not base64 anything, which is std.codec's job and the caller's.
+
+use arrowtype
+use arrowcol
+use arrowbuf
+
+// The Arrow type a Parquet column decodes to.
+//
+// From the physical type and the logical annotation together, which is
+// the only place both are known: `INT32` annotated `DATE` is
+// `ArrowDate32`, `INT64` annotated `TIMESTAMP(MICROS, adjusted)` is
+// `ArrowTimestamp(ArrowMicro, "UTC")`, and `INT64` annotated
+// `TIMESTAMP(MICROS, not adjusted)` is `ArrowTimestamp(ArrowMicro, "")`
+// — the wall clock, with the empty zone carrying the same meaning in
+// both formats.
+//
+// ```novo
+// use pqarrow
+// use pqtype
+//
+// fn main() [io]
+//     match pqarrow.arrow_type_of(PqDouble, PqLogNone, 0)
+//         Ok(_)  => println("a double is a double")
+//         Err(_) => println("no mapping")
+// ```
+pub fn arrow_type_of(physical: PqPhysical, logical: PqLogical,
+                     type_length: Int) -> Result<arrowtype.ArrowType, PqFault>
+    todo("parquet-nv.pqarrow.arrow_type_of")
+
+// The Parquet physical type and annotation an Arrow type stores as.
+//
+// Refuses the types Parquet cannot express, by name: both unions,
+// `Null`, every interval, and a dictionary whose values are not one of
+// the types a Parquet dictionary page can hold.
+pub fn parquet_type_of(t: arrowtype.ArrowType) -> Result<(PqPhysical, PqLogical, Int), PqFault>
+    todo("parquet-nv.pqarrow.parquet_type_of")
+
+// Whether reading an `INT96` as a nanosecond timestamp loses range.
+//
+// `INT96` carries a Julian day and a nanosecond-of-day, which covers
+// dates an `Int64` of nanoseconds does not — everything before 1677 and
+// after 2262.  A reader that converted silently turns a year-1500 date
+// into a year-2200 one.
+pub fn int96_is_lossy(julian_day: Int) -> Bool
+    todo("parquet-nv.pqarrow.int96_is_lossy")
+
+// An `INT96` value as nanoseconds since the epoch.
+pub fn int96_to_nanos(page: Bytes, span: arrowbuf.ArrowBuffer) -> Result<Int, PqFault>
+    todo("parquet-nv.pqarrow.int96_to_nanos")
+
+// The Arrow field a Parquet schema element becomes, children included.
+//
+// Collapses the three-level `LIST` and `MAP` shapes into Arrow's one
+// field with one child, which is the shape difference this module's
+// header is about.
+pub fn arrow_field_of(e: PqSchemaElement) -> Result<arrowtype.ArrowField, PqFault>
+    todo("parquet-nv.pqarrow.arrow_field_of")
+
+// The Arrow schema a Parquet schema describes.
+pub fn arrow_schema_of(s: PqSchema) -> Result<arrowtype.ArrowSchema, PqFault>
+    todo("parquet-nv.pqarrow.arrow_schema_of")
+
+// The Parquet schema element an Arrow field stores as.
+//
+// Expands an Arrow list into the three-level `LIST` shape, with the
+// specification's fixed inner names — `list` and `element` — because
+// every reader matches on them and a writer that chose its own produces
+// a file whose lists read as structs.
+pub fn parquet_element_of(f: arrowtype.ArrowField) -> Result<PqSchemaElement, PqFault>
+    todo("parquet-nv.pqarrow.parquet_element_of")
+
+// The Parquet schema an Arrow schema stores as.
+pub fn parquet_schema_of(s: arrowtype.ArrowSchema) -> Result<PqSchema, PqFault>
+    todo("parquet-nv.pqarrow.parquet_schema_of")
+
+// Which columns of a Parquet schema have no Arrow mapping.
+//
+// Answered from the SCHEMA, before a byte of data is read, so a caller
+// learns which columns it cannot take in one message rather than on the
+// eleventh.  The same shape arrow-nv's `unsupported_columns` takes for
+// the same reason.
+pub fn unmappable_columns(s: PqSchema) -> [Str]
+    todo("parquet-nv.pqarrow.unmappable_columns")
+
+// ── Levels and offsets, which is the real work ──────────────────────
+
+// An Arrow offsets buffer and validity bitmap from a page's levels.
+//
+// The conversion, one direction.  Answers the bytes written into the
+// caller's cursor and the element count, because a run of repetition
+// levels covers a number of LIST elements that is not the slot count
+// and not the value count — a third number, and the one Arrow's
+// `length` field wants.
+pub fn levels_to_offsets(page: Bytes, l: PqLevels, c: PqColumn,
+                         mut dst: Cursor) -> Result<(Int, Int), PqFault>
+    todo("parquet-nv.pqarrow.levels_to_offsets")
+
+// A page's definition and repetition levels from an Arrow array's
+// offsets and validity.
+//
+// The other direction, for the writer.  Answers two lists because the
+// two streams are written separately and because a column with no
+// repetition has no repetition stream at all.
+pub fn offsets_to_levels(body: Bytes, a: arrowcol.ArrowArray,
+                         c: PqColumn) -> Result<([Int], [Int]), PqFault>
+    todo("parquet-nv.pqarrow.offsets_to_levels")
+
+// ── A column chunk as an Arrow array ────────────────────────────────
+
+// One decoded column chunk, as an Arrow array over a body this call
+// wrote.
+//
+// The body is the CALLER's cursor: the values, the offsets and the
+// validity bitmap are laid down in Arrow's own layout, and the array
+// that comes back is spans into them.  So a chunk decoded here is
+// handed straight to anything that reads Arrow, with no second copy —
+// which is the reason the two packages are paired rather than
+// independent.
+pub fn chunk_to_array(body: Bytes, body_at: Int, chunk: PqColumnChunk, col: PqColumn,
+                      supplied: [PqDecompressor], cfg: PqCodecConfig,
+                      mut dst: Cursor) -> Result<(arrowcol.ArrowArray, Int), PqFault>
+    todo("parquet-nv.pqarrow.chunk_to_array")
+
+// A whole row group as an Arrow record batch.
+//
+// Every projected column decoded into one contiguous body, in the
+// schema's order, with the padding Arrow requires between buffers — so
+// the batch is one `arrowwrite.write_batch` away from being an Arrow
+// IPC message, which is the conversion a notebook actually performs.
+pub fn row_group_to_batch(body: Bytes, body_at: Int, m: PqFileMeta, row_group: Int, paths: [Str],
+                          supplied: [PqDecompressor], cfg: PqCodecConfig,
+                          mut dst: Cursor) -> Result<(arrowcol.ArrowBatch, Int), PqFault>
+    todo("parquet-nv.pqarrow.row_group_to_batch")
+
+// How large a body a row group's projected columns will need in Arrow's
+// layout.
+//
+// From the footer alone, so a caller allocates once.  Larger than the
+// compressed size in the file and usually larger than the uncompressed
+// size too, because Arrow pads every buffer and stores a null's slot.
+pub fn batch_body_bound(m: PqFileMeta, row_group: Int, paths: [Str]) -> Result<Int, PqFault>
+    todo("parquet-nv.pqarrow.batch_body_bound")
+
+// ── An Arrow batch as Parquet pages ─────────────────────────────────
+
+// One Arrow array written as a column chunk's pages.
+//
+// `rows_per_page` is the caller's, because it is a memory decision and
+// a latency decision: small pages make a predicate push-down precise
+// and make the page index large.
+pub fn array_to_chunk(w: PqWriter, body: Bytes, a: arrowcol.ArrowArray, col: PqColumn,
+                      rows_per_page: Int, buf: PqPageBuf, mut scratch: Cursor,
+                      mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqarrow.array_to_chunk")
+
+// An Arrow record batch written as one row group.
+pub fn batch_to_row_group(w: PqWriter, body: Bytes, b: arrowcol.ArrowBatch, rows_per_page: Int,
+                          buf: PqPageBuf, mut scratch: Cursor,
+                          mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+    todo("parquet-nv.pqarrow.batch_to_row_group")
+
+// ── The Arrow schema a file carries in its footer ───────────────────
+
+// The metadata key an Arrow writer stores its original schema under.
+pub fn arrow_schema_key() -> Str
+    todo("parquet-nv.pqarrow.arrow_schema_key")
+
+// Whether a footer carries one.
+//
+// Worth asking before `arrow_schema_of`: the stored schema knows things
+// the Parquet schema cannot express — a dictionary's index type, an
+// extension type, a field's own metadata — so a reader that has it
+// should prefer it, and one that does not should not pretend.
+pub fn has_arrow_schema(m: PqFileMeta) -> Bool
+    todo("parquet-nv.pqarrow.has_arrow_schema")
+
+// The base64 text of the stored schema, undecoded.
+//
+// Undecoded on purpose: base64 is std.codec's and the IPC schema
+// message is `arrowipc.read_schema`'s, and this package doing either
+// would be a third implementation of something that already has one.
+pub fn arrow_schema_text(m: PqFileMeta) -> Result<Str, PqFault>
+    todo("parquet-nv.pqarrow.arrow_schema_text")
+
+// Where an Arrow schema, encoded as an IPC schema message, should go in
+// a footer's metadata.
+//
+// The writer's half, and it takes the already-encoded text for the same
+// reason.
+pub fn with_arrow_schema(w: PqWriter, base64_text: Str) -> PqWriter
+    todo("parquet-nv.pqarrow.with_arrow_schema")

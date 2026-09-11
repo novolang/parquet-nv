@@ -1,0 +1,345 @@
+// pqtype.nv — the schema: physical types, logical annotations, the
+// repetition that makes a column nested, and the flattening that turns
+// a tree into the column chunks a row group carries.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// PARQUET HAS SIX PHYSICAL TYPES AND EVERYTHING ELSE IS AN ANNOTATION.
+// `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` and
+// `FIXED_LEN_BYTE_ARRAY` — that is the whole of what a page stores.  A
+// string is a `BYTE_ARRAY` annotated `STRING`; a date is an `INT32`
+// annotated `DATE`; a decimal is any of four physical types annotated
+// `DECIMAL(p, s)`.  So `PqPhysical` decides the DECODER and
+// `PqLogical` decides the MEANING, and a reader that conflated them
+// cannot read a file whose annotation it does not know — which it
+// should still be able to read, as the physical type, and does here.
+//
+// THERE ARE TWO ANNOTATION SYSTEMS AND BOTH ARE IN EVERY FILE.  The
+// original `ConvertedType` is an enum; `LogicalType` replaced it in
+// 2018 and is a thrift union.  Writers emit BOTH for anything the old
+// one could express, and they can disagree — a `DECIMAL` whose
+// converted type says one scale and whose logical type says another is
+// a real file somebody has.  `logical_of` states the precedence
+// (`LogicalType` wins, because it is the one that can express what the
+// newer types mean) and `converted_disagrees` is the check a tool runs
+// to find the files where it mattered.
+//
+// **THE REPETITION TYPE IS THE NESTING, AND THE SCHEMA IS A TREE WHOSE
+// LEAVES ARE THE COLUMNS.**  A column chunk exists per LEAF of the
+// schema tree, not per top-level field.  `leaves` is that flattening,
+// `max_definition_level` and `max_repetition_level` are computed from
+// the path to a leaf, and those two numbers are what `pqlevel` needs to
+// read a page at all.  Every one of them is arithmetic over the path:
+// a level goes up by one per OPTIONAL or REPEATED ancestor
+// (definition), and per REPEATED ancestor (repetition).  Getting that
+// wrong is how a nested column decodes into values at the wrong depth,
+// which looks like data rather than an error.
+
+// What a page actually stores.
+pub enum PqPhysical
+    PqBoolean
+    PqInt32
+    PqInt64
+    // 96-bit, and DEPRECATED: it existed to carry a nanosecond
+    // timestamp before `INT64` with a `TIMESTAMP` annotation did.  It
+    // is still in files written by older Hive and Spark, so it is read
+    // here — and `pqwrite` will not emit one.
+    PqInt96
+    PqFloat
+    PqDouble
+    PqByteArray
+    PqFixedLenByteArray
+
+// How many times a value may appear.
+pub enum PqRepetition
+    // Exactly once.  Contributes nothing to either level.
+    PqRequired
+    // Zero or once.  Adds one to the maximum definition level.
+    PqOptional
+    // Zero or more.  Adds one to BOTH maximum levels.
+    PqRepeated
+
+// The original annotation enum.
+pub enum PqConverted
+    PqConvNone
+    PqConvUtf8
+    PqConvMap
+    PqConvMapKeyValue
+    PqConvList
+    PqConvEnum
+    PqConvDecimal
+    PqConvDate
+    PqConvTimeMillis
+    PqConvTimeMicros
+    PqConvTimestampMillis
+    PqConvTimestampMicros
+    PqConvUint8
+    PqConvUint16
+    PqConvUint32
+    PqConvUint64
+    PqConvInt8
+    PqConvInt16
+    PqConvInt32
+    PqConvInt64
+    PqConvJson
+    PqConvBson
+    PqConvInterval
+
+// How precise a time-valued column is.
+pub enum PqTimeUnit
+    PqMillis
+    PqMicros
+    PqNanos
+
+// The annotation system that replaced `ConvertedType`.
+pub enum PqLogical
+    PqLogNone
+    PqLogString
+    PqLogEnum
+    // `precision` digits, `scale` of them after the point.
+    PqLogDecimal(precision: Int, scale: Int)
+    PqLogDate
+    // `adjusted_to_utc` is the half everybody drops.  False means the
+    // values are LOCAL — a wall clock — and true means they are
+    // instants.  The same distinction Arrow spells as an empty zone,
+    // and the same silent shift when a reader assumes.
+    PqLogTime(adjusted_to_utc: Bool, unit: PqTimeUnit)
+    PqLogTimestamp(adjusted_to_utc: Bool, unit: PqTimeUnit)
+    PqLogInteger(bit_width: Int, is_signed: Bool)
+    PqLogJson
+    PqLogBson
+    PqLogUuid
+    PqLogFloat16
+    // The three structural annotations.  They are annotations rather
+    // than types because the nesting they describe is already in the
+    // repetition types; what they add is which SHAPE the three-level
+    // encoding took.
+    PqLogList
+    PqLogMap
+    PqLogUnknown(name: Str)
+
+// One node of the schema tree.
+//
+// A leaf carries a physical type; a group carries children and no
+// physical type.  One struct for both rather than two, because the
+// thrift `SchemaElement` is one struct for both and a reader that split
+// them would have to decide which it was reading before it had read
+// the field that says.
+pub struct PqSchemaElement
+    name: Str
+    repetition: PqRepetition
+    // Meaningless on a group.
+    physical: PqPhysical
+    // For `FIXED_LEN_BYTE_ARRAY`, and for a decimal stored in one.
+    type_length: Int
+    converted: PqConverted
+    logical: PqLogical
+    children: [PqSchemaElement]
+    // The `field_id` a writer assigned, or `-1`.  Carried unread: it
+    // is how some producers match a column across schema evolution, and
+    // dropping it on a round trip would break that.
+    field_id: Int
+
+// One leaf of the schema tree — one column chunk per row group.
+//
+// The two levels are what `pqlevel` needs and what nothing else in the
+// file records: they are a property of the PATH, and a decoder that
+// re-derived them per page from the wrong ancestor list decodes a
+// nested column into values at the wrong depth.
+pub struct PqColumn
+    // The dotted path from the schema root, root name excluded.
+    path: Str
+    // The same path as its segments, because a dotted string is
+    // ambiguous when a field name contains a dot and real schemas have
+    // those.
+    segments: [Str]
+    physical: PqPhysical
+    type_length: Int
+    logical: PqLogical
+    max_definition_level: Int
+    max_repetition_level: Int
+
+// The whole schema.
+pub struct PqSchema
+    // The root, whose own name is conventionally `schema` or `spark_
+    // schema` and is not part of any column path.
+    root: PqSchemaElement
+    // The leaves, in the pre-order walk the column chunks are in.
+    columns: [PqColumn]
+
+// A leaf element.
+//
+// ```novo
+// use pqtype
+//
+// fn main() [io]
+//     let e = pqtype.leaf("price", PqOptional, PqDouble)
+//     println(e.name)
+// ```
+pub fn leaf(name: Str, repetition: PqRepetition, physical: PqPhysical) -> PqSchemaElement
+    todo("parquet-nv.pqtype.leaf")
+
+// A leaf with a logical annotation.
+pub fn annotated_leaf(name: Str, repetition: PqRepetition, physical: PqPhysical, type_length: Int,
+                      logical: PqLogical) -> PqSchemaElement
+    todo("parquet-nv.pqtype.annotated_leaf")
+
+// A group element.
+pub fn group(name: Str, repetition: PqRepetition, children: [PqSchemaElement]) -> PqSchemaElement
+    todo("parquet-nv.pqtype.group")
+
+// A group with a structural annotation — `LIST` or `MAP`.
+pub fn annotated_group(name: Str, repetition: PqRepetition, logical: PqLogical,
+                       children: [PqSchemaElement]) -> PqSchemaElement
+    todo("parquet-nv.pqtype.annotated_group")
+
+// The three-level `LIST` shape, built.
+//
+// A list is `<repetition> group <name> (LIST) { repeated group list {
+// <repetition> <type> element } }` — three levels, two of which have
+// names the specification FIXES (`list` and `element`) and which every
+// reader matches on.  Published because a hand-built list is wrong
+// four times out of five, and `check_schema` refuses every one of those
+// ways.
+pub fn list_of(name: Str, repetition: PqRepetition, element: PqSchemaElement) -> PqSchemaElement
+    todo("parquet-nv.pqtype.list_of")
+
+// The three-level `MAP` shape, built — `key_value` with a required
+// `key` and an optional `value`.
+pub fn map_of(name: Str, repetition: PqRepetition, key: PqSchemaElement,
+              value: PqSchemaElement) -> PqSchemaElement
+    todo("parquet-nv.pqtype.map_of")
+
+// A schema from a root, with its leaves flattened.
+pub fn schema(root: PqSchemaElement) -> Result<PqSchema, PqFault>
+    todo("parquet-nv.pqtype.schema")
+
+// A schema from the FLAT element list the thrift footer actually
+// carries.
+//
+// The footer does not store a tree: it stores a pre-order list where
+// each group says how many children follow.  Rebuilding the tree from
+// it is the first thing a reader does and the first place a
+// hand-written reader goes wrong — a group whose `num_children` is
+// absent is a LEAF, and treating it as a group with zero children
+// silently shifts every element after it.
+pub fn schema_of_flat(elements: [PqSchemaElement], child_counts: [Int]) -> Result<PqSchema, PqFault>
+    todo("parquet-nv.pqtype.schema_of_flat")
+
+// The flat pre-order list and the child counts a footer needs.
+pub fn flatten_schema(s: PqSchema) -> ([PqSchemaElement], [Int])
+    todo("parquet-nv.pqtype.flatten_schema")
+
+// The leaves of a schema tree, in the pre-order walk the column chunks
+// are in.
+//
+// THE FLATTENING THIS MODULE IS ABOUT.  A row group carries one column
+// chunk per leaf, in this order, and a reader whose walk differs reads
+// every column as its neighbour.
+pub fn leaves(root: PqSchemaElement) -> Result<[PqColumn], PqFault>
+    todo("parquet-nv.pqtype.leaves")
+
+// The maximum definition level on the path to a leaf.
+//
+// One per OPTIONAL or REPEATED ancestor, the leaf included.  A value at
+// the maximum is present; anything less says at which ancestor the
+// null occurred, which is what lets Parquet store a null three levels
+// deep in one integer.
+pub fn max_definition_level(path: [PqSchemaElement]) -> Int
+    todo("parquet-nv.pqtype.max_definition_level")
+
+// The maximum repetition level on the path to a leaf.
+//
+// One per REPEATED ancestor.  Zero for a column with no repetition
+// anywhere, which is the common case and the one where the repetition
+// stream is omitted entirely.
+pub fn max_repetition_level(path: [PqSchemaElement]) -> Int
+    todo("parquet-nv.pqtype.max_repetition_level")
+
+// The column with this dotted path, or a fault naming it.
+pub fn column(s: PqSchema, path: Str) -> Result<PqColumn, PqFault>
+    todo("parquet-nv.pqtype.column")
+
+// The index of the column with this path, or `-1`.
+pub fn column_index(s: PqSchema, path: Str) -> Int
+    todo("parquet-nv.pqtype.column_index")
+
+// The columns a projection names, in the projection's order.
+//
+// A projection that names a GROUP expands to every leaf under it, which
+// is what a caller asking for `orders` means and what a reader that
+// matched paths literally would answer nothing for.
+pub fn project(s: PqSchema, paths: [Str]) -> Result<[PqColumn], PqFault>
+    todo("parquet-nv.pqtype.project")
+
+// How many bytes one value of a fixed-width physical type occupies.
+//
+// `0` for `BYTE_ARRAY`, which is length-prefixed, and `type_length` for
+// `FIXED_LEN_BYTE_ARRAY`.  `BOOLEAN` answers `0` too, because a boolean
+// in a `PLAIN` page is one BIT — the same trap Arrow has, and the
+// reason this does not answer "bytes" for it.
+pub fn fixed_width_bytes(physical: PqPhysical, type_length: Int) -> Int
+    todo("parquet-nv.pqtype.fixed_width_bytes")
+
+// Whether values of this physical type are one bit each.
+pub fn is_bit_packed_physical(physical: PqPhysical) -> Bool
+    todo("parquet-nv.pqtype.is_bit_packed_physical")
+
+// The physical type's name as the footer spells it.
+pub fn physical_name(p: PqPhysical) -> Str
+    todo("parquet-nv.pqtype.physical_name")
+
+// The repetition's name.
+pub fn repetition_name(r: PqRepetition) -> Str
+    todo("parquet-nv.pqtype.repetition_name")
+
+// The logical annotation's name.
+pub fn logical_name(l: PqLogical) -> Str
+    todo("parquet-nv.pqtype.logical_name")
+
+// The annotation that applies, given both systems.
+//
+// `LogicalType` wins where it is present, because it is the one that
+// can express what the newer types mean — a microsecond timestamp that
+// is NOT adjusted to UTC has no `ConvertedType` spelling at all.  Where
+// only the converted type is present, this promotes it.
+pub fn logical_of(e: PqSchemaElement) -> PqLogical
+    todo("parquet-nv.pqtype.logical_of")
+
+// The converted type an annotation promotes from, for a writer that
+// must emit both.
+pub fn converted_of(l: PqLogical) -> PqConverted
+    todo("parquet-nv.pqtype.converted_of")
+
+// Whether an element's two annotations disagree.
+//
+// Not a fault: files like this exist and read fine under the
+// precedence rule.  It is the check a tool runs to find the ones where
+// it mattered — a decimal whose two scales differ is a column somebody
+// is reading wrong somewhere.
+pub fn converted_disagrees(e: PqSchemaElement) -> Bool
+    todo("parquet-nv.pqtype.converted_disagrees")
+
+// Every way an element is wrong on its own — a repeated root, a
+// `FIXED_LEN_BYTE_ARRAY` with no type length, a decimal whose precision
+// does not fit its width, a `LIST` whose three levels are not the
+// specification's.
+pub fn check_element(e: PqSchemaElement) -> [PqFault]
+    todo("parquet-nv.pqtype.check_element")
+
+// Every way a schema is wrong, its elements' faults included, with
+// duplicate column paths reported.
+pub fn check_schema(s: PqSchema) -> [PqFault]
+    todo("parquet-nv.pqtype.check_schema")
+
+// Whether a schema passes every check.
+pub fn schema_ok(s: PqSchema) -> Bool
+    todo("parquet-nv.pqtype.schema_ok")
+
+// How many digits a decimal of this many bytes can hold.
+//
+// The arithmetic behind `PqBadDecimal`: a `FIXED_LEN_BYTE_ARRAY(n)`
+// holds `floor(log10(2^(8n-1) - 1))` digits, and a writer that declared
+// more has written a file whose values cannot be represented.
+pub fn decimal_max_precision(bytes_wide: Int) -> Int
+    todo("parquet-nv.pqtype.decimal_max_precision")

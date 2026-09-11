@@ -1,0 +1,300 @@
+// pqencode.nv — the value encodings: how a page's bytes become values,
+// and which of them a first implementation should write.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// SEVEN ENCODINGS, AND A READER MUST HAVE ALL OF THEM.  A Parquet file
+// chooses an encoding per page, and a reader that implements a subset
+// fails on files it has no way to predict: the encoding is in the page
+// header, not the schema, so a chunk can be `PLAIN` for its first
+// hundred pages and `DELTA_BINARY_PACKED` for the rest.  What a WRITER
+// may choose is a much smaller set — see `writable_encodings` at the
+// bottom of this module, and the README's argument for it.
+//
+// THE ONE THAT IS TWO THINGS WITH ONE NAME.  `RLE` in Parquet is the
+// hybrid run-length / bit-packed encoding, and it appears in two places
+// with two different framings:
+//
+//   as a LEVEL stream       a four-byte length prefix, then the runs
+//   as a dictionary INDEX   ONE byte of bit width, then the runs, with
+//                           no length prefix at all
+//
+// A decoder that used one framing for both is four bytes off on every
+// dictionary-encoded page in the world.  `rle_decode_levels` and
+// `rle_decode_indices` are two functions for that reason, over one
+// `rle_runs`.
+//
+// AND `PLAIN_DICTIONARY` IS A NAME FOR TWO THINGS TOO.  On a DATA page
+// it is the deprecated spelling of `RLE_DICTIONARY`; on a DICTIONARY
+// page it means the dictionary's values are `PLAIN`.  The enum keeps
+// both codes because both are in files, and `effective_encoding`
+// resolves the data-page one — which is what stops a reader from
+// looking for a plain-encoded values buffer that is not there.
+//
+// BOOLEANS ARE ONE BIT IN `PLAIN`, AND THAT IS THE OTHER TRAP.  Every
+// other physical type is fixed-width bytes or length-prefixed, and
+// `BOOLEAN` is bit-packed LSB-first — so a page of a thousand booleans
+// is 125 bytes, and a decoder that read a byte each reads eight times
+// too far.
+
+use arrowbuf
+
+// How a page's values are encoded.
+pub enum PqEncoding
+    // Fixed-width little-endian for the numeric types, a four-byte
+    // length prefix per value for `BYTE_ARRAY`, `type_length` bytes for
+    // `FIXED_LEN_BYTE_ARRAY`, and BIT-PACKED for `BOOLEAN`.
+    PqPlain
+    // The deprecated name.  See this module's header: it means two
+    // different things depending on which page carries it.
+    PqPlainDictionary
+    // The hybrid run-length / bit-packed encoding.
+    PqRle
+    // DEPRECATED, and refused by name: bit-packed with the bits in the
+    // opposite order from `RLE`'s, used for levels by very old writers.
+    // A decoder that read it as `RLE` answers plausible small integers.
+    PqBitPacked
+    // Deltas between consecutive values, in blocks of miniblocks, with
+    // a per-block minimum subtracted.  The encoding that makes a sorted
+    // `INT64` column nearly free.
+    PqDeltaBinaryPacked
+    // A `BYTE_ARRAY` column's LENGTHS as delta-binary-packed integers,
+    // then every value's bytes concatenated.
+    PqDeltaLengthByteArray
+    // The same with a shared-prefix length per value as well — for
+    // sorted strings, where consecutive values share a prefix.
+    PqDeltaByteArray
+    // The bytes of each fixed-width value scattered into K streams, one
+    // per byte position.  Compresses far better under a general codec
+    // because the high bytes of a float column are nearly constant.
+    PqByteStreamSplit
+    PqUnknownEncodingCode(code: Int)
+
+// One decoded run of the hybrid encoding.
+//
+// The hybrid alternates two run kinds and the low bit of a run's header
+// says which — a bit-packed run of `count` groups of eight values, or a
+// run-length run of one repeated value.  Published as a value because a
+// caller counting nulls can walk the runs without materialising a
+// level per slot.
+pub struct PqRleRun
+    // Whether this run is bit-packed rather than run-length.
+    is_packed: Bool
+    // How many VALUES the run covers.
+    count: Int
+    // For a run-length run, the repeated value.
+    value: Int
+    // For a bit-packed run, where its bytes are.
+    payload: arrowbuf.ArrowBuffer
+
+// The encoding a footer's or a page header's code names.
+//
+// ```novo
+// use pqencode
+//
+// fn main() [io]
+//     match pqencode.encoding_of_code(0)
+//         Ok(_)  => println("plain")
+//         Err(_) => println("unknown")
+// ```
+pub fn encoding_of_code(code: Int) -> Result<PqEncoding, PqFault>
+    todo("parquet-nv.pqencode.encoding_of_code")
+
+// The encoding's own code.
+pub fn encoding_code(e: PqEncoding) -> Int
+    todo("parquet-nv.pqencode.encoding_code")
+
+// The encoding's name as the format spells it.
+pub fn encoding_name(e: PqEncoding) -> Str
+    todo("parquet-nv.pqencode.encoding_name")
+
+// What an encoding MEANS on the page that carries it.
+//
+// Resolves `PLAIN_DICTIONARY`: `RLE_DICTIONARY` on a data page,
+// `PLAIN` on a dictionary page.  The call that keeps a reader from
+// looking for a plain values buffer that is not there.
+pub fn effective_encoding(e: PqEncoding, is_dictionary_page: Bool) -> PqEncoding
+    todo("parquet-nv.pqencode.effective_encoding")
+
+// Whether this encoding stores dictionary indices rather than values.
+pub fn is_dictionary_encoding(e: PqEncoding, is_dictionary_page: Bool) -> Bool
+    todo("parquet-nv.pqencode.is_dictionary_encoding")
+
+// Whether an encoding may be used with a physical type.
+//
+// Not every pair is legal: `DELTA_BINARY_PACKED` is integers only,
+// `DELTA_LENGTH_BYTE_ARRAY` is `BYTE_ARRAY` only, `BYTE_STREAM_SPLIT`
+// is fixed-width only.  A page whose pair is illegal is corrupt, and
+// checking is cheaper than decoding garbage.
+pub fn encoding_fits(e: PqEncoding, physical: PqPhysical) -> Bool
+    todo("parquet-nv.pqencode.encoding_fits")
+
+// ── PLAIN ───────────────────────────────────────────────────────────
+
+// How many bytes `count` values of a fixed-width type occupy in
+// `PLAIN`.
+//
+// For `BOOLEAN` this is `ceil(count / 8)`, which is the trap this
+// module's header names, and it is why the answer is a function rather
+// than a multiplication at every call site.
+pub fn plain_size(physical: PqPhysical, type_length: Int, count: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_size")
+
+// Element `i` of a `PLAIN` fixed-width values buffer, as an integer.
+//
+// Covers `BOOLEAN`, `INT32`, `INT64` and `INT96`.
+pub fn plain_int_at(page: Bytes, values: arrowbuf.ArrowBuffer, physical: PqPhysical,
+                    i: Int) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_int_at")
+
+// Element `i` as a float — `FLOAT` and `DOUBLE`.
+pub fn plain_float_at(page: Bytes, values: arrowbuf.ArrowBuffer, physical: PqPhysical,
+                      i: Int) -> Result<Float, PqFault>
+    todo("parquet-nv.pqencode.plain_float_at")
+
+// The span of element `i` of a `PLAIN` `BYTE_ARRAY` buffer.
+//
+// A `BYTE_ARRAY` in `PLAIN` has no offsets buffer — each value is a
+// four-byte little-endian length followed by its bytes — so random
+// access is a SCAN.  That is a property of the format and not of this
+// implementation, and it is why `plain_byte_array_spans` exists beside
+// this: a caller reading a whole page should walk once.
+pub fn plain_byte_array_at(page: Bytes, values: arrowbuf.ArrowBuffer,
+                           i: Int) -> Result<arrowbuf.ArrowBuffer, PqFault>
+    todo("parquet-nv.pqencode.plain_byte_array_at")
+
+// Every value's span in a `PLAIN` `BYTE_ARRAY` buffer, in one walk.
+pub fn plain_byte_array_spans(page: Bytes, values: arrowbuf.ArrowBuffer,
+                              count: Int) -> Result<[arrowbuf.ArrowBuffer], PqFault>
+    todo("parquet-nv.pqencode.plain_byte_array_spans")
+
+// The span of element `i` of a `FIXED_LEN_BYTE_ARRAY` buffer, which IS
+// random access.
+pub fn plain_fixed_at(values: arrowbuf.ArrowBuffer, type_length: Int,
+                      i: Int) -> Result<arrowbuf.ArrowBuffer, PqFault>
+    todo("parquet-nv.pqencode.plain_fixed_at")
+
+// ── RLE / bit-packed hybrid ─────────────────────────────────────────
+
+// The runs of a hybrid-encoded stream at `bit_width` bits per value.
+//
+// The one decoder both framings share.  A caller that only needs to
+// count — how many nulls, how many records — walks these; a caller that
+// needs every value calls one of the two `decode` functions.
+pub fn rle_runs(page: Bytes, span: arrowbuf.ArrowBuffer, bit_width: Int,
+                count: Int) -> Result<[PqRleRun], PqFault>
+    todo("parquet-nv.pqencode.rle_runs")
+
+// A LEVEL stream: a four-byte length prefix, then the runs.
+pub fn rle_decode_levels(page: Bytes, at: Int, bit_width: Int,
+                         count: Int) -> Result<([Int], Int), PqFault>
+    todo("parquet-nv.pqencode.rle_decode_levels")
+
+// A dictionary INDEX stream: one byte of bit width, then the runs, and
+// NO length prefix.
+//
+// See this module's header: reading this with the level framing is four
+// bytes of error on every dictionary-encoded page there is.
+pub fn rle_decode_indices(page: Bytes, values: arrowbuf.ArrowBuffer,
+                          count: Int) -> Result<[Int], PqFault>
+    todo("parquet-nv.pqencode.rle_decode_indices")
+
+// The bit width a dictionary index stream declares in its first byte.
+pub fn rle_index_bit_width(page: Bytes, values: arrowbuf.ArrowBuffer) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.rle_index_bit_width")
+
+// ── The delta encodings ─────────────────────────────────────────────
+
+// A `DELTA_BINARY_PACKED` integer stream.
+//
+// Blocks of miniblocks: a header of block size, miniblock count, total
+// value count and a first value, then per block a zigzag minimum delta
+// and a bit width per miniblock.  The per-miniblock width is why a
+// column that is mostly monotonic with one jump does not pay for the
+// jump everywhere.
+pub fn delta_binary_decode(page: Bytes, span: arrowbuf.ArrowBuffer,
+                           count: Int) -> Result<[Int], PqFault>
+    todo("parquet-nv.pqencode.delta_binary_decode")
+
+// A `DELTA_LENGTH_BYTE_ARRAY` page: the lengths, then the concatenated
+// bytes, answered as spans.
+pub fn delta_length_decode(page: Bytes, span: arrowbuf.ArrowBuffer,
+                           count: Int) -> Result<[arrowbuf.ArrowBuffer], PqFault>
+    todo("parquet-nv.pqencode.delta_length_decode")
+
+// A `DELTA_BYTE_ARRAY` page.
+//
+// Answers COPIES rather than spans, and that is forced by the encoding:
+// a value is a shared prefix of the PREVIOUS value plus a suffix, so
+// the value does not exist contiguously anywhere in the page.  The one
+// place in this package where a decode must allocate, and it is said
+// here rather than discovered.
+pub fn delta_byte_array_decode(page: Bytes, span: arrowbuf.ArrowBuffer,
+                               count: Int) -> Result<[Bytes], PqFault>
+    todo("parquet-nv.pqencode.delta_byte_array_decode")
+
+// ── BYTE_STREAM_SPLIT ───────────────────────────────────────────────
+
+// A `BYTE_STREAM_SPLIT` page, reassembled into the `PLAIN` layout.
+//
+// K streams of `count` bytes, where stream `k` holds byte `k` of every
+// value.  Reassembling is a transpose, and it writes into a cursor the
+// caller sized rather than allocating — a whole page of doubles is the
+// caller's memory.
+pub fn byte_stream_split_into(page: Bytes, span: arrowbuf.ArrowBuffer, width: Int, count: Int,
+                              mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.byte_stream_split_into")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+// The encodings a first implementation should WRITE.
+//
+// `PLAIN`, `RLE_DICTIONARY` with a `PLAIN` dictionary page, and `RLE`
+// for the level streams — and nothing else.  The argument, which the
+// README repeats: those three are the set that every Parquet reader in
+// existence supports, including readers from before the delta
+// encodings were specified, so a file written with them opens
+// everywhere.  The delta encodings and byte-stream-split are worth
+// writing when the size difference is measured on real data, which is a
+// decision for the implementation rather than the interface.
+pub fn writable_encodings() -> [PqEncoding]
+    todo("parquet-nv.pqencode.writable_encodings")
+
+// Whether this package's writer will emit an encoding.
+pub fn is_writable(e: PqEncoding) -> Bool
+    todo("parquet-nv.pqencode.is_writable")
+
+// `count` integers written `PLAIN` at a physical type's width.
+pub fn plain_write_ints(values: [Int], physical: PqPhysical,
+                        mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_write_ints")
+
+// Floats written `PLAIN`.
+pub fn plain_write_floats(values: [Float], physical: PqPhysical,
+                          mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_write_floats")
+
+// Booleans written `PLAIN` — bit-packed, LSB first.
+pub fn plain_write_bools(values: [Bool], mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_write_bools")
+
+// Byte arrays written `PLAIN`, each with its four-byte length.
+pub fn plain_write_byte_arrays(values: [Bytes], mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.plain_write_byte_arrays")
+
+// A hybrid-encoded stream with the dictionary-index framing.
+pub fn rle_write_indices(indices: [Int], bit_width: Int, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.rle_write_indices")
+
+// A hybrid-encoded stream with the level framing.
+pub fn rle_write_levels(levels: [Int], bit_width: Int, mut dst: Cursor) -> Result<Int, PqFault>
+    todo("parquet-nv.pqencode.rle_write_levels")
+
+// An upper bound on the hybrid encoding of this many values at this bit
+// width.
+//
+// The worst case is every value in its own bit-packed group, which is
+// what a caller must size for, and it is what makes the bound worth
+// publishing rather than guessing.
+pub fn rle_bound(count: Int, bit_width: Int) -> Int
+    todo("parquet-nv.pqencode.rle_bound")
