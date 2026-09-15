@@ -283,9 +283,10 @@ shape.
 - **Bloom filters.**
 - **A writer for the column index.** The reader reads one.
 - **A dictionary builder.** See rule 13.
-- **A microcontroller build.** A footer is a tree of boxed structs with
-  a string per column path, and a row group is a growable list. This
-  package makes no device claim and ships no device probe.
+- **A microcontroller build.** A footer is a tree of boxed structs with a
+  string per column path, and a row group is a growable list. Nothing here is
+  claimed to build for a device with no heap allocator, and there is no
+  `tests/embedded_probe.nv`.
 
 ## Related packages
 
