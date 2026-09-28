@@ -3,9 +3,9 @@
 [arrow-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "df950a0403f3fb2fcef8380cca25408f04eb9d4155eb9c0e14bc72bfd7902d8c"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "e4b8767bfa68fff59579dee8602f713e6fce36c38d2e96775eca1c2d1bd8fd8a"
 
 [bitstream-nv]
 source = "registry"
@@ -17,9 +17,9 @@ hash = "e445c7e82c01e2ade0d6199683d938849cf56a6e6b41ffd39490d6effc04c9e4"
 [calendar-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "96409f46f3946d4b40437754edc7e8a6f044521cfe286f5723ff10205a581f48"
+req = "^0.2.0"
+version = "0.2.1"
+hash = "c81b54f47ee0efd44548a81c1427880e4a001e3133333b268b8d331ccd480e42"
 
 [flate-nv]
 source = "registry"

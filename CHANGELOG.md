@@ -5,6 +5,16 @@ All notable changes to parquet-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-28
+
+The dependency ranges move to the dependencies' current releases.  A
+pre-1.0 caret range admits only the release it names, so the old
+ranges held this package on interface releases, and a program could
+not take this package beside those packages' current releases.  No
+signature in this package changed.
+
+- arrow-nv: `^0.0.1` to `^0.1.0`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

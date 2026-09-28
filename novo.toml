@@ -1,6 +1,6 @@
 [package]
 name        = "parquet-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The Apache Parquet file format over arrow-nv: the footer and its thrift-compact subset, row groups, column chunks, pages with every encoding, definition and repetition levels for nested data, statistics, and page compression through the published codecs.  The reader ASKS for byte ranges and the host answers them, so a projection never reads the columns it did not name.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -54,7 +54,7 @@ novo        = ">= 0.8.9"
 # published package depends on published packages, so this becomes
 # `arrow-nv = "^0.0.1"` before the first publish — which `novo pkg
 # publish` refuses to do for us, by design, and says so at this line.
-arrow-nv = "^0.0.1"
+arrow-nv = "^0.1.0"
 
 # flate-nv, FOR THE `GZIP` PAGE COMPRESSION.
 #
