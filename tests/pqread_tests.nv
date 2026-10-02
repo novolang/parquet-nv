@@ -21,6 +21,7 @@ use pqencode
 use pqpage
 use pqfault
 use pqtype
+use arrowbuf
 
 fn a_footer() -> PqFileMeta
     let one = pqtype.leaf("price", PqOptional, PqDouble)
@@ -241,3 +242,216 @@ fn test_a_v2_page_can_be_stored_uncompressed_inside_a_compressed_chunk() [io]
 
     test.case("so the next page is found from the COMPRESSED size, never the other one")
     test.assert(pqpage.next_page_at(h) == 64 + 100)
+
+// ── Configuring a reader ────────────────────────────────────────────
+
+// A reader of a 1 MiB file with nothing chosen, built rather than asked
+// for, so a test's first red names the call it is about.
+fn a_reader() -> PqReader
+    PqReader { file_len: 1048576, projection: [], row_groups: [], use_page_index: false,
+               page_limit: 1048576, decompressors: [], config: a_config(), has_footer: false }
+
+// A codec configuration with a window the test chose.
+fn a_config() -> PqCodecConfig
+    PqCodecConfig { gzip_format: GzipWrapped, zstd_window_limit: 2097152, zstd_level: 3 }
+
+// A stand-in codec whose output is its input: the size is the length.
+fn same_size(src: Bytes, at: Int, len: Int) -> Int
+    len
+
+// A stand-in codec whose output is its input: a copy of the span.
+fn same_bytes(src: Bytes, at: Int, len: Int) -> Bytes
+    bytes.slice(src, at, at + len)
+
+@test
+fn test_each_reader_option_is_a_new_reader_carrying_that_choice() [io]
+    test.case("a projection names its columns")
+    test.assert(list.len(pqread.with_projection(a_reader(), ["price"]).projection) == 1)
+
+    test.case("a row group selection names its row groups")
+    test.assert(list.len(pqread.with_row_groups(a_reader(), [0, 2]).row_groups) == 2)
+
+    test.case("the page index is off until asked for")
+    test.assert(a_reader().use_page_index == false)
+    test.assert(pqread.with_page_index(a_reader()).use_page_index)
+
+    test.case("the page limit is the caller's")
+    test.assert(pqread.with_page_limit(a_reader(), 4096).page_limit == 4096)
+
+    test.case("a supplied decompressor is carried to every page")
+    let d = PqDecompressor { codec: PqSnappy, sized_by: same_size, run: same_bytes }
+    test.assert(list.len(pqread.with_decompressors(a_reader(), [d]).decompressors) == 1)
+
+    test.case("and a configuration replaces the default one")
+    let cfg = PqCodecConfig { gzip_format: GzipWrapped, zstd_window_limit: 65536, zstd_level: 1 }
+    test.assert(pqread.with_config(a_reader(), cfg).config.zstd_window_limit == 65536)
+
+// ── Answering requests ──────────────────────────────────────────────
+
+@test
+fn test_a_host_that_answers_ranges_nobody_asked_for_is_refused() [io]
+    test.case("a fresh reader asked for the tail, not two ranges at the front")
+    let ranges = [arrowbuf.buffer(0, 4), arrowbuf.buffer(4, 4)]
+    match pqread.supply_many(a_reader(), ranges, [bytes.zeros(4), bytes.zeros(4)])
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pqfault.is_corrupt(f) == false)
+
+    test.case("and a body count that does not match the range count is refused")
+    match pqread.supply_many(a_reader(), ranges, [bytes.zeros(4)])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_reader_has_no_footer_until_the_host_supplies_one() [io]
+    match pqread.footer_of(a_reader())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+// ── Reading a chunk that is already in hand ─────────────────────────
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// A required INT64 column, which has neither level stream.
+fn qty_column() -> PqColumn
+    PqColumn { path: "qty", segments: ["qty"], physical: PqInt64, type_length: 0,
+               logical: PqLogNone, max_definition_level: 0, max_repetition_level: 0 }
+
+// Statistics with nothing claimed.
+fn nothing_claimed() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(0, 0), max_span: arrowbuf.buffer(0, 0), has_min: false,
+              has_max: false, min_value_span: arrowbuf.buffer(0, 0),
+              max_value_span: arrowbuf.buffer(0, 0), has_min_value: false, has_max_value: false,
+              null_count: 0, has_null_count: false, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: false, is_min_value_exact: false }
+
+// A chunk of ten INT64 values starting at file offset 1000, with or
+// without a dictionary page in front.
+fn qty_chunk(dictionary_at: Int, compressed: Int) -> PqColumnChunk
+    PqColumnChunk { path: "qty", physical: PqInt64, codec: PqUncompressed, num_values: 10,
+                    total_uncompressed_size: compressed, total_compressed_size: compressed,
+                    data_page_offset: 1000, dictionary_page_offset: dictionary_at,
+                    offset_index_offset: 0 - 1, offset_index_length: 0,
+                    column_index_offset: 0 - 1, column_index_length: 0, encodings: [PqPlain],
+                    stats: nothing_claimed(), has_stats: false }
+
+// One uncompressed v1 data page of ten PLAIN INT64 values: a 19-byte
+// header (type 0, eighty bytes either way, ten values, PLAIN, RLE
+// levels) and eighty bytes of zeros.
+fn one_page_chunk() -> Bytes
+    hex("1500" + "15a001" + "15a001" + "2c" + "1514" + "1500" + "1506" + "1506" + "00" + "00"
+        + str.repeat("00", 80))
+
+@test
+fn test_a_chunk_in_hand_is_walked_page_by_page_without_decompressing() [io]
+    match pqread.pages_of(one_page_chunk(), 1000, qty_chunk(0 - 1, 99))
+        Err(_) => test.assert(false)
+        Ok(hs) =>
+            test.assert(list.len(hs) == 1)
+            test.assert(hs[0].compressed_size == 80)
+            test.assert(hs[0].payload_at == 1019)
+
+@test
+fn test_a_data_page_is_copied_into_the_callers_cursor_with_its_levels_located() [io]
+    let h = PqPageHeader { kind: PqDataPageV1, compressed_size: 80, uncompressed_size: 80,
+                           crc: 0, has_crc: false, payload_at: 1019, header_len: 19 }
+    let d = PqDataPage { num_values: 10, num_non_null: 0 - 1, num_rows: 0 - 1,
+                         encoding: PqPlain, definition_encoding: PqRle,
+                         repetition_encoding: PqRle, definition_len: 0, repetition_len: 0,
+                         is_compressed: true, stats: nothing_claimed(), has_stats: false }
+    var dst = room(128)
+
+    match pqread.read_page(one_page_chunk(), 1000, h, d, qty_chunk(0 - 1, 99), qty_column(), [],
+                           a_config(), dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("eighty bytes written")
+            test.assert(p.0 == 80)
+
+            test.case("a required flat column has no level streams")
+            test.assert(p.1.has_definition == false)
+            test.assert(p.1.has_repetition == false)
+
+            test.case("so the values are the whole page")
+            test.assert(p.2.len == 80)
+
+@test
+fn test_a_dictionary_is_decoded_once_into_the_callers_cursor_as_spans() [io]
+    // A dictionary page header (type 2, forty bytes either way, five
+    // PLAIN entries), then five INT64 entries.
+    let body = hex("1504" + "1550" + "1550" + "4c" + "150a" + "1500" + "00" + "00"
+                   + str.repeat("00", 40))
+    var dst = room(64)
+
+    match pqread.dictionary_of(body, 1000, qty_chunk(1000, 53), qty_column(), [], a_config(), dst)
+        Err(_) => test.assert(false)
+        Ok(ss) =>
+            test.assert(list.len(ss) == 5)
+            test.assert(ss[1].len == 8)
+
+@test
+fn test_one_scratch_buffer_sized_for_the_largest_page_serves_every_page() [io]
+    let small = PqPageHeader { kind: PqDataPageV1, compressed_size: 50, uncompressed_size: 100,
+                               crc: 0, has_crc: false, payload_at: 20, header_len: 20 }
+    let large = PqPageHeader { kind: PqDataPageV1, compressed_size: 90, uncompressed_size: 300,
+                               crc: 0, has_crc: false, payload_at: 90, header_len: 20 }
+    test.assert(pqread.scratch_bound([small, large]) >= 300)
+
+// ── Taking a whole file from a host ─────────────────────────────────
+
+// A source over bytes already in memory, which is what makes the
+// driven reader testable without a filesystem.
+struct InMemory
+    body: Bytes
+
+impl PqSource[] for InMemory
+    fn read_at(self, at: Int, len: Int) -> Result<Bytes, IoError> []
+        Ok(bytes.slice(self.body, at, at + len))
+
+// A whole file of 41 bytes: PAR1, a 29-byte footer (version 1, a root
+// with the one required INT64 leaf "id", zero rows, no row groups), the
+// footer length and PAR1 again.
+fn tiny_file() -> InMemory
+    InMemory { body: hex("50415231" + "1502" + "19" + "2c" + "48" + "06" + "736368656d61" + "1502"
+                         + "00" + "1504" + "2500" + "18" + "02" + "6964" + "00" + "1600" + "19"
+                         + "0c" + "00" + "1d000000" + "50415231") }
+
+@test
+fn test_the_footer_alone_is_two_reads_from_a_source() [io]
+    match pqread.read_footer_from(tiny_file(), 41)
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.assert(m.version == 1)
+            test.assert(list.len(m.schema.columns) == 1)
+            test.assert(m.schema.columns[0].path == "id")
+
+// One for a footer event, zero for any other.
+fn is_footer(e: PqEvent) -> Int
+    match e
+        PqFooterReady(_) => 1
+        _                => 0
+
+@test
+fn test_a_driven_reader_reports_the_footer_as_an_event() [io]
+    let r = PqReader { file_len: 41, projection: [], row_groups: [], use_page_index: false,
+                       page_limit: 1048576, decompressors: [], config: a_config(),
+                       has_footer: false }
+
+    match pqread.read_all(tiny_file(), r)
+        Err(_) => test.assert(false)
+        Ok(es) =>
+            var footers = 0
+            for e in es
+                footers = footers + is_footer(e)
+            test.assert(footers == 1)
+
+@test
+fn test_a_row_group_the_file_does_not_have_is_refused() [io]
+    match pqread.read_row_group(tiny_file(), 41, 0, ["id"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

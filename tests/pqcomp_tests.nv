@@ -1,0 +1,167 @@
+// pqcomp_tests.nv — page compression: the configuration each native
+// codec runs with, the caller's buffer as the budget, and the
+// decompressor a caller supplies for a codec this build lacks.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE BOUNDS.  A page header can declare any size, so
+// what is asserted is that a declared size past the caller's room or
+// the caller's limit is refused before anything is read, and that a
+// writer sizes for a codec's worst case rather than for its input.
+
+use std.test
+use std.list
+use pqcomp
+use pqfault
+use arrowbuf
+
+// A configuration with a window the test chose, built rather than asked
+// for, so a test's first red names the call it is about.
+fn a_config() -> PqCodecConfig
+    PqCodecConfig { gzip_format: GzipWrapped, zstd_window_limit: 1048576, zstd_level: 3 }
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// No caller-supplied codecs, built as an empty list.
+fn nothing_supplied() -> [PqDecompressor]
+    []
+
+// A stand-in codec whose output is its input: the size is the length.
+fn same_size(src: Bytes, at: Int, len: Int) -> Int
+    len
+
+// A stand-in codec whose output is its input: a copy of the span.
+fn same_bytes(src: Bytes, at: Int, len: Int) -> Bytes
+    bytes.slice(src, at, at + len)
+
+@test
+fn test_the_default_reads_gzip_as_gzip_and_bounds_the_zstd_window() [io]
+    let cfg = pqcomp.default_config()
+
+    test.case("GZIP is a gzip stream with its header, not raw deflate and not zlib")
+    match cfg.gzip_format
+        GzipWrapped => test.assert(true)
+        _           => test.assert(false)
+
+    test.case("and the zstd window has a limit, because a frame can ask for 3.75 GiB")
+    test.assert(cfg.zstd_window_limit > 0)
+
+@test
+fn test_each_native_codec_is_built_from_the_configuration() [io]
+    let cfg = a_config()
+
+    test.case("the gzip format is the configured one")
+    match pqcomp.gzip_format(cfg)
+        GzipWrapped => test.assert(true)
+        _           => test.assert(false)
+
+    test.case("the zstd decoder carries the caller's window limit, passed straight through")
+    test.assert_eq(pqcomp.zstd_decoder(cfg).window_limit, 1048576)
+
+    test.case("and a zstd encoder at a valid level is built")
+    match pqcomp.zstd_encoder(cfg)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_supplied_decompressor_makes_an_unavailable_codec_readable() [io]
+    let d = pqcomp.decompressor(PqSnappy, same_size, same_bytes)
+
+    test.case("it is for the codec it was built for")
+    match d.codec
+        PqSnappy => test.assert(true)
+        _        => test.assert(false)
+
+    test.case("and with it supplied, Snappy can be read")
+    test.assert(pqcomp.can_read(PqSnappy, [d]))
+
+@test
+fn test_an_uncompressed_page_is_copied_into_the_callers_cursor() [io]
+    let src = bytes.from_str("xxabcdxx")
+    var dst = room(4)
+
+    match pqcomp.decompress_into(src, arrowbuf.buffer(2, 4), PqUncompressed, 4,
+                                 nothing_supplied(), dst)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert_eq(n, 4)
+            test.assert_eq(bytes.to_str(bytes.slice(dst.finish(), 0, 4)), "abcd")
+
+@test
+fn test_a_declared_size_past_the_cursor_room_is_refused_before_reading() [io]
+    let src = bytes.from_str("abcd")
+    var small = room(8)
+
+    match pqcomp.decompress_into(src, arrowbuf.buffer(0, 4), PqZstd, 1000000,
+                                 nothing_supplied(), small)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                PqPageTooLarge(want, limit, _) =>
+                    test.assert_eq(want, 1000000)
+                    test.assert_eq(limit, 8)
+                _                              => test.assert(false)
+
+@test
+fn test_the_allocating_form_is_bounded_by_the_callers_limit() [io]
+    let src = bytes.from_str("abcd")
+
+    test.case("an uncompressed page under the limit is answered whole")
+    match pqcomp.decompress(src, arrowbuf.buffer(0, 4), PqUncompressed, 4, 64,
+                            nothing_supplied())
+        Ok(b)  => test.assert_eq(bytes.len(b), 4)
+        Err(_) => test.assert(false)
+
+    test.case("a declared size past the limit is refused before anything is allocated")
+    match pqcomp.decompress(src, arrowbuf.buffer(0, 4), PqZstd, 1000000, 64,
+                            nothing_supplied())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and Snappy with nothing supplied is unavailable, not corrupt")
+    match pqcomp.decompress(src, arrowbuf.buffer(0, 4), PqSnappy, 4, 64, nothing_supplied())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pqfault.is_unavailable(f))
+
+@test
+fn test_the_writer_emits_three_codecs_and_not_lz4_raw() [io]
+    let w = pqcomp.writable_codecs()
+    test.assert_eq(list.len(w), 3)
+
+    for c in w
+        let is_lz4_raw = match c
+            PqLz4Raw => true
+            _        => false
+        test.assert(is_lz4_raw == false)
+
+@test
+fn test_a_compressed_bound_is_never_below_the_input() [io]
+    test.case("every codec can grow incompressible input, so the bound is at least n")
+    match pqcomp.compress_bound(PqZstd, 1000)
+        Ok(n)  => test.assert(n >= 1000)
+        Err(_) => test.assert(false)
+    match pqcomp.compress_bound(PqGzip, 1000)
+        Ok(n)  => test.assert(n >= 1000)
+        Err(_) => test.assert(false)
+
+@test
+fn test_compressing_into_a_cursor_answers_the_bytes_written() [io]
+    let src = bytes.from_str("abcdabcdabcdabcd")
+    var dst = room(64)
+
+    test.case("UNCOMPRESSED writes the span as it is")
+    match pqcomp.compress_into(src, 0, 16, PqUncompressed, dst)
+        Ok(n)  => test.assert_eq(n, 16)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_page_the_codec_did_not_shrink_is_stored_raw() [io]
+    test.case("a compressed form no smaller than the input is not worth decompressing")
+    test.assert(pqcomp.should_store_raw(1000, 1000))
+    test.assert(pqcomp.should_store_raw(1010, 1000))
+
+    test.case("a page that shrank is stored compressed")
+    test.assert(pqcomp.should_store_raw(300, 1000) == false)

@@ -157,7 +157,7 @@ pub fn unreadable_codecs(m: PqFileMeta, supplied: [PqDecompressor]) -> [Str]
 // how it knows it may.
 pub fn decompress_into(src: Bytes, payload: arrowbuf.ArrowBuffer, codec: PqCodec,
                        uncompressed_size: Int, supplied: [PqDecompressor],
-                       mut dst: Cursor) -> Result<Int, PqFault>
+                       var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqcomp.decompress_into")
 
 // Decompress a page payload, allocating.
@@ -192,7 +192,7 @@ pub fn compress_bound(codec: PqCodec, n: Int) -> Result<Int, PqFault>
 
 // Compress a page payload into a cursor the caller sized.
 pub fn compress_into(src: Bytes, at: Int, len: Int, codec: PqCodec,
-                     mut dst: Cursor) -> Result<Int, PqFault>
+                     var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqcomp.compress_into")
 
 // Whether a writer should store this page uncompressed after all.

@@ -129,7 +129,7 @@ pub fn footer_bound(s: PqSchema, row_groups: Int) -> Int
 // ── Writing ─────────────────────────────────────────────────────────
 
 // The opening `PAR1`.
-pub fn write_prologue(w: PqWriter, mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+pub fn write_prologue(w: PqWriter, var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_prologue")
 
 // Start a row group.
@@ -142,8 +142,8 @@ pub fn open_row_group(w: PqWriter) -> Result<PqWriter, PqFault>
 // being first — so calling this after a data page is refused rather
 // than written in the wrong place.
 pub fn write_dictionary_page(w: PqWriter, c: PqColumn, values: [Bytes], buf: PqPageBuf,
-                             mut scratch: Cursor,
-                             mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                             var scratch: Cursor,
+                             var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_dictionary_page")
 
 // A data page of integer values with their levels.
@@ -154,32 +154,32 @@ pub fn write_dictionary_page(w: PqWriter, c: PqColumn, values: [Bytes], buf: PqP
 // format rather than an oversight: a page of a thousand slots in a
 // half-null column carries five hundred values.
 pub fn write_int_page(w: PqWriter, c: PqColumn, values: [Int], definitions: [Int],
-                      repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
-                      mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                      repetitions: [Int], buf: PqPageBuf, var scratch: Cursor,
+                      var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_int_page")
 
 // A data page of floating-point values.
 pub fn write_float_page(w: PqWriter, c: PqColumn, values: [Float], definitions: [Int],
-                        repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
-                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                        repetitions: [Int], buf: PqPageBuf, var scratch: Cursor,
+                        var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_float_page")
 
 // A data page of boolean values.
 pub fn write_bool_page(w: PqWriter, c: PqColumn, values: [Bool], definitions: [Int],
-                       repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
-                       mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                       repetitions: [Int], buf: PqPageBuf, var scratch: Cursor,
+                       var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_bool_page")
 
 // A data page of byte arrays.
 pub fn write_bytes_page(w: PqWriter, c: PqColumn, values: [Bytes], definitions: [Int],
-                        repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
-                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                        repetitions: [Int], buf: PqPageBuf, var scratch: Cursor,
+                        var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_bytes_page")
 
 // A data page of dictionary indices.
 pub fn write_index_page(w: PqWriter, c: PqColumn, indices: [Int], dictionary_size: Int,
-                        definitions: [Int], repetitions: [Int], buf: PqPageBuf, mut scratch: Cursor,
-                        mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                        definitions: [Int], repetitions: [Int], buf: PqPageBuf, var scratch: Cursor,
+                        var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.write_index_page")
 
 // Close a column chunk, recording its offsets and statistics.
@@ -199,7 +199,7 @@ pub fn close_row_group(w: PqWriter, rows: Int) -> Result<PqWriter, PqFault>
 //
 // One call, because a file whose footer is missing is a file no reader
 // opens and a caller that could forget it would.
-pub fn finish(w: PqWriter, mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+pub fn finish(w: PqWriter, var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqwrite.finish")
 
 // ── Statistics a writer computes ────────────────────────────────────

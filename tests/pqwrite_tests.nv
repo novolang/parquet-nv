@@ -1,0 +1,325 @@
+// pqwrite_tests.nv — the writer: sizing before anything is written,
+// pages into the caller's cursors, chunks and row groups closed in
+// order, and a footer that is never forgotten.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE ORDER OF CALLS.  A Parquet file is valid only if
+// the opening magic comes first, a chunk's pages are inside its row
+// group, every leaf has a chunk, and the footer and closing magic come
+// last.  So what is asserted is that each call moves the writer's
+// offset by what it wrote, that a row group missing a column is
+// refused, and that `finish` ends the file with `PAR1`.
+//
+// The schema has four flat leaves, one per value kind a page writer
+// takes: a required INT64, an optional DOUBLE, a required BOOLEAN and
+// an optional BYTE_ARRAY.  Every level list below holds one entry per
+// SLOT, and every value list one entry per STORED value.
+
+use std.test
+use std.list
+use pqwrite
+use arrowbuf
+
+// One flat leaf of the schema below.
+fn flat_column(name: Str, physical: PqPhysical, max_definition: Int) -> PqColumn
+    PqColumn { path: name, segments: [name], physical: physical, type_length: 0,
+               logical: PqLogNone, max_definition_level: max_definition,
+               max_repetition_level: 0 }
+
+// The four leaves, in schema order.
+fn qty() -> PqColumn
+    flat_column("qty", PqInt64, 0)
+
+fn price() -> PqColumn
+    flat_column("price", PqDouble, 1)
+
+fn flag() -> PqColumn
+    flat_column("flag", PqBoolean, 0)
+
+fn label() -> PqColumn
+    flat_column("label", PqByteArray, 1)
+
+// A schema element with no annotation.
+fn element(name: Str, repetition: PqRepetition, physical: PqPhysical,
+           children: [PqSchemaElement]) -> PqSchemaElement
+    PqSchemaElement { name: name, repetition: repetition, physical: physical, type_length: 0,
+                      converted: PqConvNone, logical: PqLogNone, children: children[:],
+                      field_id: 0 - 1 }
+
+// The four-leaf schema, built rather than asked for, so a test's first
+// red names the call it is about.
+fn four_leaves() -> PqSchema
+    let root = element("schema", PqRequired, PqInt64,
+                       [element("qty", PqRequired, PqInt64, []),
+                        element("price", PqOptional, PqDouble, []),
+                        element("flag", PqRequired, PqBoolean, []),
+                        element("label", PqOptional, PqByteArray, [])])
+    PqSchema { root: root, columns: [qty(), price(), flag(), label()] }
+
+// A schema whose one leaf is the deprecated INT96.
+fn with_int96() -> PqSchema
+    let root = element("schema", PqRequired, PqInt64, [element("ts", PqRequired, PqInt96, [])])
+    PqSchema { root: root, columns: [flat_column("ts", PqInt96, 0)] }
+
+// A codec configuration with a window the test chose.
+fn a_config() -> PqCodecConfig
+    PqCodecConfig { gzip_format: GzipWrapped, zstd_window_limit: 1048576, zstd_level: 3 }
+
+// A writer with `written` bytes behind it, the opening magic written,
+// and a row group open with `chunks` already closed.
+fn writer_at(written: Int, chunks: [PqColumnChunk]) -> PqWriter
+    PqWriter { schema: four_leaves(), codec: PqUncompressed, config: a_config(),
+               written: written, row_groups: [], open_chunks: chunks[:], open_rows: 0,
+               key_value_metadata: [], created_by: "", started: true }
+
+// A writer that has written nothing.
+fn unstarted() -> PqWriter
+    PqWriter { schema: four_leaves(), codec: PqUncompressed, config: a_config(), written: 0,
+               row_groups: [], open_chunks: [], open_rows: 0, key_value_metadata: [],
+               created_by: "", started: false }
+
+// Statistics with nothing claimed.
+fn nothing_claimed() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(0, 0), max_span: arrowbuf.buffer(0, 0), has_min: false,
+              has_max: false, min_value_span: arrowbuf.buffer(0, 0),
+              max_value_span: arrowbuf.buffer(0, 0), has_min_value: false, has_max_value: false,
+              null_count: 0, has_null_count: false, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: false, is_min_value_exact: false }
+
+// A closed chunk of the `qty` column.
+fn qty_chunk() -> PqColumnChunk
+    PqColumnChunk { path: "qty", physical: PqInt64, codec: PqUncompressed, num_values: 3,
+                    total_uncompressed_size: 50, total_compressed_size: 50,
+                    data_page_offset: 4, dictionary_page_offset: 0 - 1,
+                    offset_index_offset: 0 - 1, offset_index_length: 0,
+                    column_index_offset: 0 - 1, column_index_length: 0, encodings: [PqPlain],
+                    stats: nothing_claimed(), has_stats: false }
+
+// An empty scratch buffer.
+fn no_pages() -> PqPageBuf
+    PqPageBuf { raw_len: 0, packed_len: 0 }
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// ── Building a writer ───────────────────────────────────────────────
+
+@test
+fn test_a_new_writer_has_written_nothing_and_not_even_the_magic() [io]
+    match pqwrite.writer(four_leaves(), PqZstd, a_config())
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.assert_eq(w.written, 0)
+            test.assert(w.started == false)
+            test.assert_eq(list.len(w.row_groups), 0)
+
+    test.case("a schema with an INT96 column is refused, because this writer will not emit one")
+    match pqwrite.writer(with_int96(), PqZstd, a_config())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_writer_names_its_producer_and_carries_custom_metadata() [io]
+    test.assert_eq(pqwrite.with_created_by(unstarted(), "ingest 2.1").created_by, "ingest 2.1")
+
+    let w = pqwrite.with_metadata(unstarted(), "origin", "sensor-7")
+    test.assert_eq(list.len(w.key_value_metadata), 1)
+    test.assert_eq(w.key_value_metadata[0].key, "origin")
+    test.assert_eq(w.key_value_metadata[0].value, "sensor-7")
+
+// ── Sizing ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_page_scratch_bound_is_never_below_the_plain_values() [io]
+    test.case("a thousand INT64 are eight thousand bytes before any codec")
+    match pqwrite.page_scratch_bound(qty(), 1000, PqUncompressed)
+        Ok(n)  => test.assert(n >= 8000)
+        Err(_) => test.assert(false)
+
+    test.case("and a codec can only add to that, because it can grow random data")
+    match pqwrite.page_scratch_bound(qty(), 1000, PqZstd)
+        Ok(n)  => test.assert(n >= 8000)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_footer_bound_grows_with_the_row_groups() [io]
+    let one = pqwrite.footer_bound(four_leaves(), 1)
+    test.assert(one > 0)
+    test.assert(pqwrite.footer_bound(four_leaves(), 10) > one)
+
+// ── Writing, in order ───────────────────────────────────────────────
+
+@test
+fn test_the_prologue_is_the_four_bytes_par1() [io]
+    var dst = room(8)
+
+    match pqwrite.write_prologue(unstarted(), dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1, 4)
+            test.assert_eq(p.0.written, 4)
+            test.assert(p.0.started)
+            test.assert_eq(bytes.to_str(bytes.slice(dst.finish(), 0, 4)), "PAR1")
+
+@test
+fn test_a_row_group_opens_with_no_chunks_and_no_rows() [io]
+    match pqwrite.open_row_group(writer_at(4, []))
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.assert_eq(list.len(w.open_chunks), 0)
+            test.assert_eq(w.open_rows, 0)
+
+@test
+fn test_a_dictionary_page_moves_the_offset_by_what_it_wrote() [io]
+    var scratch = room(4096)
+    var dst = room(4096)
+    let values = [bytes.from_str("north"), bytes.from_str("south")]
+
+    match pqwrite.write_dictionary_page(writer_at(4, []), label(), values, no_pages(), scratch,
+                                        dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.1 > 0)
+            test.assert_eq(p.0.written, 4 + p.1)
+
+@test
+fn test_each_kind_of_data_page_moves_the_offset_by_what_it_wrote() [io]
+    test.case("INT64, required: three slots, three values")
+    var s1 = room(4096)
+    var d1 = room(4096)
+    match pqwrite.write_int_page(writer_at(4, []), qty(), [1, 2, 3], [0, 0, 0], [0, 0, 0],
+                                 no_pages(), s1, d1)
+        Ok(p)  => test.assert_eq(p.0.written, 4 + p.1)
+        Err(_) => test.assert(false)
+
+    test.case("DOUBLE, optional: two slots, one of them null, so one value")
+    var s2 = room(4096)
+    var d2 = room(4096)
+    match pqwrite.write_float_page(writer_at(4, []), price(), [1.5], [1, 0], [0, 0], no_pages(),
+                                   s2, d2)
+        Ok(p)  => test.assert_eq(p.0.written, 4 + p.1)
+        Err(_) => test.assert(false)
+
+    test.case("BOOLEAN, required")
+    var s3 = room(4096)
+    var d3 = room(4096)
+    match pqwrite.write_bool_page(writer_at(4, []), flag(), [true, false, true], [0, 0, 0],
+                                  [0, 0, 0], no_pages(), s3, d3)
+        Ok(p)  => test.assert_eq(p.0.written, 4 + p.1)
+        Err(_) => test.assert(false)
+
+    test.case("BYTE_ARRAY, optional")
+    var s4 = room(4096)
+    var d4 = room(4096)
+    match pqwrite.write_bytes_page(writer_at(4, []), label(), [bytes.from_str("north")], [1, 0],
+                                   [0, 0], no_pages(), s4, d4)
+        Ok(p)  => test.assert_eq(p.0.written, 4 + p.1)
+        Err(_) => test.assert(false)
+
+    test.case("dictionary indices into a dictionary of two")
+    var s5 = room(4096)
+    var d5 = room(4096)
+    match pqwrite.write_index_page(writer_at(4, []), label(), [0, 1, 0], 2, [1, 1, 1], [0, 0, 0],
+                                   no_pages(), s5, d5)
+        Ok(p)  => test.assert_eq(p.0.written, 4 + p.1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_page_whose_values_do_not_match_its_levels_is_refused() [io]
+    test.case("two slots at the maximum definition level need two values, not one")
+    var s1 = room(4096)
+    var d1 = room(4096)
+    match pqwrite.write_float_page(writer_at(4, []), price(), [1.5], [1, 1], [0, 0], no_pages(),
+                                   s1, d1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("an index past the dictionary's size is refused")
+    var s2 = room(4096)
+    var d2 = room(4096)
+    match pqwrite.write_index_page(writer_at(4, []), label(), [0, 5], 2, [1, 1], [0, 0],
+                                   no_pages(), s2, d2)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_closing_a_chunk_records_it_in_the_open_row_group() [io]
+    match pqwrite.close_chunk(writer_at(54, []), qty(), nothing_claimed(), false)
+        Ok(w)  => test.assert_eq(list.len(w.open_chunks), 1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_row_group_missing_a_column_is_refused() [io]
+    test.case("one chunk of four leaves is the all-null column a writer forgot")
+    match pqwrite.close_row_group(writer_at(54, [qty_chunk()]), 3)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_finish_ends_the_file_with_the_footer_and_par1() [io]
+    var dst = room(4096)
+
+    match pqwrite.finish(writer_at(4, []), dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert(p.1 > 8)
+            let tail = bytes.slice(dst.finish(), p.1 - 4, p.1)
+            test.assert_eq(bytes.to_str(tail), "PAR1")
+
+// ── Statistics a writer computes ────────────────────────────────────
+
+@test
+fn test_integer_statistics_write_only_the_unsigned_ordering_bounds() [io]
+    let s = pqwrite.int_stats([3, 1, 2], 0)
+
+    test.case("min_value and max_value, and the null count")
+    test.assert(s.has_min_value)
+    test.assert(s.has_max_value)
+    test.assert(s.has_null_count)
+    test.assert_eq(s.null_count, 0)
+
+    test.case("and never the deprecated signed pair")
+    test.assert(s.has_min == false)
+    test.assert(s.has_max == false)
+
+@test
+fn test_float_statistics_omit_the_bounds_when_a_value_is_nan() [io]
+    test.case("a column with no NaN has both bounds")
+    let clean = pqwrite.float_stats([1.0, 2.5], 0)
+    test.assert(clean.has_min_value)
+    test.assert(clean.has_max_value)
+
+    test.case("one NaN and there are none, because a bound computed over NaN means nothing")
+    let s = pqwrite.float_stats([1.0, math.nan()], 0)
+    test.assert(s.has_min_value == false)
+    test.assert(s.has_max_value == false)
+
+@test
+fn test_a_truncated_byte_array_bound_is_marked_inexact() [io]
+    let long = [bytes.from_str("aardvark-population"), bytes.from_str("zebra-crossing-count")]
+    let s = pqwrite.bytes_stats(long, 0, 4)
+
+    test.case("the bounds are no longer than the caller allowed")
+    test.assert(s.min_value_span.len <= 4)
+    test.assert(s.max_value_span.len <= 4)
+
+    test.case("and a reader is told the max was rounded rather than copied")
+    test.assert(s.is_max_value_exact == false)
+
+@test
+fn test_dictionary_encoding_pays_for_few_distinct_wide_values() [io]
+    test.case("ten distinct values of thirty-two bytes in a hundred thousand rows")
+    test.assert(pqwrite.dictionary_hint(10, 100000, 32))
+
+    test.case("nearly every value distinct and each four bytes wide")
+    test.assert(pqwrite.dictionary_hint(90000, 100000, 4) == false)
+
+@test
+fn test_a_reset_scratch_buffer_has_built_nothing() [io]
+    let b = pqwrite.page_buf()
+    test.assert_eq(b.raw_len, 0)
+    test.assert_eq(b.packed_len, 0)
+    test.assert_eq(pqwrite.built_span(no_pages()).len, 0)

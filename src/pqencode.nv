@@ -242,7 +242,7 @@ pub fn delta_byte_array_decode(page: Bytes, span: arrowbuf.ArrowBuffer,
 // caller sized rather than allocating — a whole page of doubles is the
 // caller's memory.
 pub fn byte_stream_split_into(page: Bytes, span: arrowbuf.ArrowBuffer, width: Int, count: Int,
-                              mut dst: Cursor) -> Result<Int, PqFault>
+                              var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.byte_stream_split_into")
 
 // ── Writing ─────────────────────────────────────────────────────────
@@ -266,28 +266,28 @@ pub fn is_writable(e: PqEncoding) -> Bool
 
 // `count` integers written `PLAIN` at a physical type's width.
 pub fn plain_write_ints(values: [Int], physical: PqPhysical,
-                        mut dst: Cursor) -> Result<Int, PqFault>
+                        var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.plain_write_ints")
 
 // Floats written `PLAIN`.
 pub fn plain_write_floats(values: [Float], physical: PqPhysical,
-                          mut dst: Cursor) -> Result<Int, PqFault>
+                          var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.plain_write_floats")
 
 // Booleans written `PLAIN` — bit-packed, LSB first.
-pub fn plain_write_bools(values: [Bool], mut dst: Cursor) -> Result<Int, PqFault>
+pub fn plain_write_bools(values: [Bool], var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.plain_write_bools")
 
 // Byte arrays written `PLAIN`, each with its four-byte length.
-pub fn plain_write_byte_arrays(values: [Bytes], mut dst: Cursor) -> Result<Int, PqFault>
+pub fn plain_write_byte_arrays(values: [Bytes], var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.plain_write_byte_arrays")
 
 // A hybrid-encoded stream with the dictionary-index framing.
-pub fn rle_write_indices(indices: [Int], bit_width: Int, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn rle_write_indices(indices: [Int], bit_width: Int, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.rle_write_indices")
 
 // A hybrid-encoded stream with the level framing.
-pub fn rle_write_levels(levels: [Int], bit_width: Int, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn rle_write_levels(levels: [Int], bit_width: Int, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqencode.rle_write_levels")
 
 // An upper bound on the hybrid encoding of this many values at this bit

@@ -1,0 +1,253 @@
+// pqlevel_tests.nv — reading the two level streams of a nested column,
+// and writing them.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE ONE PAGE.  The column is `a.b.c` from the format's own
+// documentation — optional `a`, repeated group `b`, optional `c` — so
+// its maximum definition level is 3 and its maximum repetition level is
+// 1.  The page holds four records in five slots:
+//
+//     record  value                         rep  def
+//     1       a.b = [{c: 1}, {c: null}]      0    3
+//                                            1    2
+//     2       a = null                       0    0
+//     3       a.b = []                       0    1
+//     4       a.b = [{c: 7}]                 0    3
+//
+// Each stream is one bit-packed run of eight values: a header byte of
+// `03`, then the values packed LSB first.  Repetition at one bit is
+// `02`; definition at two bits is `4b 03`.
+
+use std.test
+use std.list
+use pqlevel
+use arrowbuf
+
+// The column `a.b.c`, built rather than asked for, so a test's first
+// red names the call it is about.
+fn abc() -> PqColumn
+    PqColumn { path: "a.b.c", segments: ["a", "b", "c"], physical: PqInt32, type_length: 0,
+               logical: PqLogNone, max_definition_level: 3, max_repetition_level: 1 }
+
+// A flat required column, which has neither stream.
+fn flat() -> PqColumn
+    PqColumn { path: "flat", segments: ["flat"], physical: PqInt64, type_length: 0,
+               logical: PqLogNone, max_definition_level: 0, max_repetition_level: 0 }
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// The page with the v1 framing: each stream behind a four-byte length,
+// repetition first.
+fn v1_page() -> Bytes
+    hex("020000000302" + "03000000034b03")
+
+// The same streams with the v2 framing: no length prefixes, repetition
+// first, the lengths in the page header.
+fn v2_page() -> Bytes
+    hex("0302" + "034b03")
+
+// The levels of `v2_page`, located by hand.
+fn located() -> PqLevels
+    PqLevels { definition: arrowbuf.buffer(2, 3), repetition: arrowbuf.buffer(0, 2),
+               has_definition: true, has_repetition: true, max_definition: 3, max_repetition: 1,
+               count: 5 }
+
+// One schema element with no annotation.
+fn element(name: Str, repetition: PqRepetition, children: [PqSchemaElement]) -> PqSchemaElement
+    PqSchemaElement { name: name, repetition: repetition, physical: PqInt32, type_length: 0,
+                      converted: PqConvNone, logical: PqLogNone, children: children[:],
+                      field_id: 0 - 1 }
+
+// The path from the root to `c`: `a`, `b`, `c`.
+fn abc_path() -> [PqSchemaElement]
+    let c = element("c", PqOptional, [])
+    let b = element("b", PqRepeated, [c])
+    let a = element("a", PqOptional, [b])
+    [a, b, c]
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// ── Locating the streams ────────────────────────────────────────────
+
+@test
+fn test_a_v1_page_keeps_both_streams_behind_length_prefixes() [io]
+    match pqlevel.levels_of_v1(v1_page(), 0, abc(), 5)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.case("both streams are present, because both maxima are above zero")
+            test.assert(l.has_repetition)
+            test.assert(l.has_definition)
+            test.assert_eq(l.count, 5)
+            test.assert_eq(l.max_definition, 3)
+            test.assert_eq(l.max_repetition, 1)
+
+            test.case("and the definition stream decodes past the repetition one")
+            match pqlevel.definitions(v1_page(), l)
+                Ok(ds) => test.assert_eq(ds[3], 1)
+                Err(_) => test.assert(false)
+
+@test
+fn test_a_v2_page_takes_its_stream_lengths_from_the_header() [io]
+    match pqlevel.levels_of_v2(v2_page(), 0, 3, 2, abc(), 5)
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.case("repetition first, two bytes")
+            test.assert_eq(l.repetition.start, 0)
+            test.assert_eq(l.repetition.len, 2)
+
+            test.case("then definition, three bytes")
+            test.assert_eq(l.definition.start, 2)
+            test.assert_eq(l.definition.len, 3)
+
+// ── Reading the levels ──────────────────────────────────────────────
+
+@test
+fn test_one_slot_can_be_read_without_decoding_the_page() [io]
+    test.case("slot 1 is the null element of the first record's list")
+    match pqlevel.definition_at(v2_page(), located(), 1)
+        Ok(d)  => test.assert_eq(d, 2)
+        Err(_) => test.assert(false)
+
+    test.case("and it continues that record's repeated group")
+    match pqlevel.repetition_at(v2_page(), located(), 1)
+        Ok(r)  => test.assert_eq(r, 1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_whole_streams_decode_to_one_level_per_slot() [io]
+    match pqlevel.definitions(v2_page(), located())
+        Err(_) => test.assert(false)
+        Ok(ds) =>
+            test.assert_eq(list.len(ds), 5)
+            test.assert_eq(ds[0], 3)
+            test.assert_eq(ds[1], 2)
+            test.assert_eq(ds[2], 0)
+            test.assert_eq(ds[3], 1)
+            test.assert_eq(ds[4], 3)
+
+    match pqlevel.repetitions(v2_page(), located())
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert_eq(list.len(rs), 5)
+            test.assert_eq(rs[0], 0)
+            test.assert_eq(rs[1], 1)
+            test.assert_eq(rs[2], 0)
+
+@test
+fn test_a_slot_is_stored_exactly_when_its_definition_is_the_maximum() [io]
+    test.case("slot 0 holds the value 1")
+    match pqlevel.is_stored(v2_page(), located(), 0)
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    test.case("slot 1 is a null and holds nothing")
+    match pqlevel.is_stored(v2_page(), located(), 1)
+        Ok(b)  => test.assert(b == false)
+        Err(_) => test.assert(false)
+
+    test.case("five slots, two stored values: the values buffer holds two")
+    match pqlevel.stored_count(v2_page(), located())
+        Ok(n)  => test.assert_eq(n, 2)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_record_starts_at_every_repetition_level_of_zero() [io]
+    match pqlevel.record_starts(v2_page(), located())
+        Err(_) => test.assert(false)
+        Ok(xs) =>
+            test.assert_eq(list.len(xs), 4)
+            test.assert_eq(xs[0], 0)
+            test.assert_eq(xs[1], 2)
+            test.assert_eq(xs[2], 3)
+            test.assert_eq(xs[3], 4)
+
+    test.case("so five slots are four records, which the page header does not say")
+    match pqlevel.record_count(v2_page(), located())
+        Ok(n)  => test.assert_eq(n, 4)
+        Err(_) => test.assert(false)
+
+@test
+fn test_one_definition_level_says_which_ancestor_was_absent() [io]
+    test.case("0: a is null")
+    match pqlevel.absent_at_depth(v2_page(), located(), 2)
+        Ok(d)  => test.assert_eq(d, 0)
+        Err(_) => test.assert(false)
+
+    test.case("1: a is present and its list is empty")
+    match pqlevel.absent_at_depth(v2_page(), located(), 3)
+        Ok(d)  => test.assert_eq(d, 1)
+        Err(_) => test.assert(false)
+
+    test.case("3, the maximum: the value is present")
+    match pqlevel.absent_at_depth(v2_page(), located(), 0)
+        Ok(d)  => test.assert_eq(d, 3)
+        Err(_) => test.assert(false)
+
+@test
+fn test_an_empty_list_and_a_null_are_told_apart_by_the_schema_path() [io]
+    test.case("level 1 stops at the repeated b, so the list is empty")
+    test.assert(pqlevel.is_empty_list_level(abc(), abc_path(), 1))
+
+    test.case("level 0 stops at the optional a, which is a null")
+    test.assert(pqlevel.is_empty_list_level(abc(), abc_path(), 0) == false)
+
+    test.case("level 2 stops at the optional c, a null element, not an empty list")
+    test.assert(pqlevel.is_empty_list_level(abc(), abc_path(), 2) == false)
+
+@test
+fn test_a_page_whose_first_repetition_is_not_zero_is_reported() [io]
+    test.case("the page above contradicts nothing")
+    test.assert_eq(list.len(pqlevel.check_levels(v2_page(), located(), abc())), 0)
+
+    test.case("a repetition stream starting 1, 1 has no first record boundary")
+    let bad = hex("0303" + "034b03")
+    test.assert(list.len(pqlevel.check_levels(bad, located(), abc())) > 0)
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_flat_required_column_has_no_streams_at_all() [io]
+    let l = pqlevel.flat_levels(10)
+    test.assert(l.has_definition == false)
+    test.assert(l.has_repetition == false)
+    test.assert_eq(l.count, 10)
+    test.assert_eq(l.max_definition, 0)
+    test.assert_eq(l.max_repetition, 0)
+
+@test
+fn test_the_written_streams_fit_the_published_bound() [io]
+    test.case("five definition levels at two bits")
+    var d = room(64)
+    match pqlevel.write_definitions([3, 2, 0, 1, 3], abc(), d)
+        Ok(n)  =>
+            test.assert(n > 0)
+            test.assert(n <= pqlevel.level_bound(5, 3))
+        Err(_) => test.assert(false)
+
+    test.case("five repetition levels at one bit")
+    var r = room(64)
+    match pqlevel.write_repetitions([0, 1, 0, 0, 0], abc(), r)
+        Ok(n)  =>
+            test.assert(n > 0)
+            test.assert(n <= pqlevel.level_bound(5, 1))
+        Err(_) => test.assert(false)
+
+    test.case("a column whose maximum is zero writes no stream, not an empty one")
+    var none = room(64)
+    match pqlevel.write_repetitions([0, 0, 0], flat(), none)
+        Ok(n)  => test.assert_eq(n, 0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_level_bound_covers_one_bit_per_slot_at_least() [io]
+    test.case("a thousand one-bit levels need at least 125 bytes")
+    test.assert(pqlevel.level_bound(1000, 1) >= 125)
+
+    test.case("and two bits per slot need at least twice that")
+    test.assert(pqlevel.level_bound(1000, 3) >= 250)

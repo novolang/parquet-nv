@@ -1,0 +1,264 @@
+// pqmeta_tests.nv — the footer: finding it from the tail, decoding it,
+// looking things up in it, and reading its statistics sceptically.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE LOOKUPS A READER MAKES BEFORE IT READS A PAGE.
+// Where the footer is, which chunk is which column, which byte range a
+// chunk covers, and whether a chunk or a page may hold a value.  The
+// footer below is built as a value, so each test's red names the call
+// it is about; the thrift inputs are spelled in hex, one field per
+// group of digits, against `parquet.thrift`.
+
+use std.test
+use std.list
+use pqmeta
+use arrowbuf
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// Statistics with nothing claimed.
+fn nothing_claimed() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(0, 0), max_span: arrowbuf.buffer(0, 0), has_min: false,
+              has_max: false, min_value_span: arrowbuf.buffer(0, 0),
+              max_value_span: arrowbuf.buffer(0, 0), has_min_value: false, has_max_value: false,
+              null_count: 0, has_null_count: false, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: false, is_min_value_exact: false }
+
+// Statistics carrying only the deprecated, signed-comparison bounds.
+fn signed_only() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(10, 2), max_span: arrowbuf.buffer(12, 2), has_min: true,
+              has_max: true, min_value_span: arrowbuf.buffer(0, 0),
+              max_value_span: arrowbuf.buffer(0, 0), has_min_value: false, has_max_value: false,
+              null_count: 0, has_null_count: true, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: true, is_min_value_exact: true }
+
+// Statistics carrying the unsigned-ordering bounds as well.
+fn unsigned_too() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(10, 2), max_span: arrowbuf.buffer(12, 2), has_min: true,
+              has_max: true, min_value_span: arrowbuf.buffer(20, 2),
+              max_value_span: arrowbuf.buffer(22, 2), has_min_value: true,
+              has_max_value: true, null_count: 0, has_null_count: true, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: true, is_min_value_exact: true }
+
+// One required or optional leaf directly under the root.
+fn column_of(name: Str, max_definition: Int, physical: PqPhysical) -> PqColumn
+    PqColumn { path: name, segments: [name], physical: physical, type_length: 0,
+               logical: PqLogNone, max_definition_level: max_definition,
+               max_repetition_level: 0 }
+
+// A schema element with no annotation.
+fn element(name: Str, repetition: PqRepetition, physical: PqPhysical,
+           children: [PqSchemaElement]) -> PqSchemaElement
+    PqSchemaElement { name: name, repetition: repetition, physical: physical, type_length: 0,
+                      converted: PqConvNone, logical: PqLogNone, children: children[:],
+                      field_id: 0 - 1 }
+
+// One column chunk of a thousand values.
+fn chunk(path: Str, physical: PqPhysical, data_at: Int, dictionary_at: Int,
+         compressed: Int) -> PqColumnChunk
+    PqColumnChunk { path: path, physical: physical, codec: PqZstd, num_values: 1000,
+                    total_uncompressed_size: 8000, total_compressed_size: compressed,
+                    data_page_offset: data_at, dictionary_page_offset: dictionary_at,
+                    offset_index_offset: 0 - 1, offset_index_length: 0,
+                    column_index_offset: 0 - 1, column_index_length: 0, encodings: [PqPlain],
+                    stats: nothing_claimed(), has_stats: false }
+
+// A footer of two columns, one row group of a thousand rows, and an
+// `ARROW:schema` entry.
+fn footer_with_rows(num_rows: Int) -> PqFileMeta
+    let price = element("price", PqOptional, PqDouble, [])
+    let qty = element("qty", PqRequired, PqInt64, [])
+    let root = element("schema", PqRequired, PqInt64, [price, qty])
+    let s = PqSchema { root: root,
+                       columns: [column_of("price", 1, PqDouble), column_of("qty", 0, PqInt64)] }
+    let g = PqRowGroup { columns: [chunk("price", PqDouble, 1004, 4, 3000),
+                                   chunk("qty", PqInt64, 3004, 0 - 1, 2000)],
+                         num_rows: 1000, total_byte_size: 5000, file_offset: 0 - 1, ordinal: 0 }
+    PqFileMeta { version: 2, schema: s, num_rows: num_rows, row_groups: [g],
+                 key_value_metadata: [PqKeyValue { key: "ARROW:schema", value: "/////w==",
+                                                   has_value: true }],
+                 created_by: "parquet-nv 0.0.3" }
+
+// The same footer with its row counts agreeing.
+fn a_footer() -> PqFileMeta
+    footer_with_rows(1000)
+
+// ── Finding and decoding the footer ─────────────────────────────────
+
+@test
+fn test_both_ends_of_a_file_are_par1() [io]
+    test.assert_eq(bytes.to_str(pqmeta.magic()), "PAR1")
+
+@test
+fn test_the_footer_position_is_arithmetic_over_the_last_eight_bytes() [io]
+    test.case("a 200-byte footer in a 1000-byte file starts at 1000 - 8 - 200")
+    match pqmeta.footer_position(hex("c8000000" + "50415231"), 1000)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.0, 792)
+            test.assert_eq(p.1, 200)
+
+    test.case("a tail that does not end in PAR1 is refused")
+    match pqmeta.footer_position(hex("c8000000" + "00000000"), 1000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a footer length that points before the start of the file is refused")
+    match pqmeta.footer_position(hex("e8030000" + "50415231"), 1000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_footer_decodes_into_its_schema_and_row_groups() [io]
+    // FileMetaData: version 1; a schema of the root "schema" with one
+    // child and the required INT64 leaf "id"; zero rows; no row groups.
+    let src = hex("1502" + "19" + "2c" + "48" + "06" + "736368656d61" + "1502" + "00" + "1504"
+                  + "2500" + "18" + "02" + "6964" + "00" + "1600" + "19" + "0c" + "00")
+
+    match pqmeta.read_footer(src, 0, bytes.len(src))
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.assert_eq(m.version, 1)
+            test.assert_eq(list.len(m.schema.columns), 1)
+            test.assert_eq(m.schema.columns[0].path, "id")
+            test.assert_eq(m.num_rows, 0)
+            test.assert_eq(list.len(m.row_groups), 0)
+
+// ── Looking things up ───────────────────────────────────────────────
+
+@test
+fn test_a_chunk_range_starts_at_the_chunk_start_and_covers_its_compressed_size() [io]
+    let g = a_footer().row_groups[0]
+
+    test.case("without a dictionary, from the first data page")
+    let q = pqmeta.chunk_range(g.columns[1])
+    test.assert_eq(q.start, 3004)
+    test.assert_eq(q.len, 2000)
+
+    test.case("with one, from the dictionary page")
+    test.assert_eq(pqmeta.chunk_range(g.columns[0]).start, 4)
+
+@test
+fn test_a_chunk_is_found_by_its_path_and_a_row_group_by_its_index() [io]
+    let m = a_footer()
+
+    match pqmeta.chunk_of(m.row_groups[0], "qty")
+        Ok(c)  => test.assert_eq(c.data_page_offset, 3004)
+        Err(_) => test.assert(false)
+    match pqmeta.chunk_of(m.row_groups[0], "missing")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match pqmeta.row_group(m, 0)
+        Ok(g)  => test.assert_eq(g.num_rows, 1000)
+        Err(_) => test.assert(false)
+    match pqmeta.row_group(m, 1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_metadata_value_says_whether_the_key_was_there() [io]
+    let m = a_footer()
+
+    let present = pqmeta.metadata_value(m, "ARROW:schema")
+    test.assert_eq(present.0, "/////w==")
+    test.assert(present.1)
+
+    let absent = pqmeta.metadata_value(m, "missing")
+    test.assert(absent.1 == false)
+
+// ── Statistics, read sceptically ────────────────────────────────────
+
+@test
+fn test_a_range_with_no_statistics_is_never_ruled_out() [io]
+    test.assert(pqmeta.may_overlap(nothing_claimed(), PqInt64, bytes.zeros(8), bytes.zeros(8),
+                                   "parquet-nv 0.0.3"))
+
+@test
+fn test_the_bounds_read_are_the_unsigned_pair_when_it_is_there() [io]
+    let both = pqmeta.bounds_of(unsigned_too())
+    let old = pqmeta.bounds_of(signed_only())
+
+    test.case("with both pairs present, the unsigned-ordering pair is answered")
+    test.assert_eq(both.0.start, 20)
+    test.assert_eq(both.1.start, 22)
+
+    test.case("with only the deprecated pair, that pair is answered")
+    test.assert_eq(old.0.start, 10)
+
+    test.case("and the flag tells the two apart, because the comparison differs")
+    test.assert(both.2 != old.2)
+
+@test
+fn test_a_footer_whose_row_counts_disagree_is_reported() [io]
+    test.case("the footer above contradicts nothing")
+    test.assert_eq(list.len(pqmeta.check_footer(a_footer())), 0)
+    test.assert(pqmeta.footer_ok(a_footer()))
+
+    test.case("a file row count that is not the sum of its row groups' is reported")
+    test.assert(list.len(pqmeta.check_footer(footer_with_rows(999))) > 0)
+    test.assert(pqmeta.footer_ok(footer_with_rows(999)) == false)
+
+// ── The page index ──────────────────────────────────────────────────
+
+@test
+fn test_the_offset_index_is_one_location_per_page() [io]
+    // OffsetIndex: a list of one PageLocation — offset 4, 100 bytes,
+    // first row 0
+    let src = hex("19" + "1c" + "1608" + "15c801" + "1600" + "00" + "00")
+
+    match pqmeta.read_offset_index(src, 0, bytes.len(src))
+        Err(_) => test.assert(false)
+        Ok(ls) =>
+            test.assert_eq(list.len(ls), 1)
+            test.assert_eq(ls[0].offset, 4)
+            test.assert_eq(ls[0].compressed_page_size, 100)
+            test.assert_eq(ls[0].first_row_index, 0)
+
+@test
+fn test_the_column_index_is_one_set_of_statistics_per_page() [io]
+    // ColumnIndex of one page: null_pages [false], min_values [05],
+    // max_values [09], boundary order 0
+    let src = hex("19" + "11" + "00" + "19" + "18" + "0105" + "19" + "18" + "0109" + "1500" + "00")
+
+    match pqmeta.read_column_index(src, 0, bytes.len(src))
+        Ok(ss) => test.assert_eq(list.len(ss), 1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_pages_with_no_statistics_are_all_kept() [io]
+    let ls = [PqPageLocation { offset: 4, compressed_page_size: 100, first_row_index: 0 },
+              PqPageLocation { offset: 104, compressed_page_size: 100, first_row_index: 50 },
+              PqPageLocation { offset: 204, compressed_page_size: 100, first_row_index: 100 }]
+    let ss = [nothing_claimed(), nothing_claimed(), nothing_claimed()]
+
+    let kept = pqmeta.pages_that_may_contain(ls, ss, PqInt64, bytes.zeros(8), "parquet-nv 0.0.3")
+    test.assert_eq(list.len(kept), 3)
+    test.assert_eq(kept[0], 0)
+    test.assert_eq(kept[2], 2)
+
+// ── Codecs ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_codec_is_named_and_numbered_as_the_footer_spells_it() [io]
+    test.case("the names are the thrift enum's")
+    test.assert_eq(pqmeta.codec_name(PqZstd), "ZSTD")
+    test.assert_eq(pqmeta.codec_name(PqSnappy), "SNAPPY")
+    test.assert_eq(pqmeta.codec_name(PqLz4Raw), "LZ4_RAW")
+
+    test.case("6 is ZSTD and 7 is LZ4_RAW")
+    match pqmeta.codec_of_code(6)
+        Ok(PqZstd) => test.assert(true)
+        _          => test.assert(false)
+    match pqmeta.codec_of_code(7)
+        Ok(PqLz4Raw) => test.assert(true)
+        _            => test.assert(false)
+
+    test.case("a code the format does not have is refused")
+    match pqmeta.codec_of_code(99)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

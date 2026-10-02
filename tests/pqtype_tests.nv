@@ -218,3 +218,82 @@ fn test_duplicate_column_paths_are_reported_because_every_lookup_breaks() [io]
         Ok(s)  =>
             test.assert(list.len(pqtype.check_schema(s)) > 0)
             test.assert(pqtype.schema_ok(s) == false)
+
+// One leaf with no annotation, built rather than asked for, so a test's
+// first red names the call it is about.
+fn bare_leaf(name: Str, repetition: PqRepetition, physical: PqPhysical) -> PqSchemaElement
+    PqSchemaElement { name: name, repetition: repetition, physical: physical, type_length: 0,
+                      converted: PqConvNone, logical: PqLogNone, children: [], field_id: 0 - 1 }
+
+@test
+fn test_a_structural_annotation_rides_on_a_group() [io]
+    let inner = bare_leaf("element", PqOptional, PqInt64)
+    let g = pqtype.annotated_group("tags", PqOptional, PqLogList, [inner])
+
+    test.assert(g.name == "tags")
+    test.assert(list.len(g.children) == 1)
+    match g.logical
+        PqLogList => test.assert(true)
+        _         => test.assert(false)
+
+@test
+fn test_the_three_level_map_shape_has_a_required_key_and_an_optional_value() [io]
+    let k = bare_leaf("key", PqRequired, PqByteArray)
+    let v = bare_leaf("value", PqOptional, PqInt64)
+    let m = pqtype.map_of("attrs", PqOptional, k, v)
+
+    test.case("the built shape passes its own check")
+    test.assert(list.len(pqtype.check_element(m)) == 0)
+
+    test.case("the middle level is the repeated key_value group the specification names")
+    test.assert(list.len(m.children) == 1)
+    test.assert(m.children[0].name == "key_value")
+    match m.children[0].repetition
+        PqRepeated => test.assert(true)
+        _          => test.assert(false)
+
+    test.case("and under it the key, then the value")
+    test.assert(list.len(m.children[0].children) == 2)
+    match m.children[0].children[0].repetition
+        PqRequired => test.assert(true)
+        _          => test.assert(false)
+    match m.children[0].children[1].repetition
+        PqOptional => test.assert(true)
+        _          => test.assert(false)
+
+@test
+fn test_a_physical_type_is_named_as_the_footer_spells_it() [io]
+    test.assert(pqtype.physical_name(PqInt64) == "INT64")
+    test.assert(pqtype.physical_name(PqByteArray) == "BYTE_ARRAY")
+    test.assert(pqtype.physical_name(PqFixedLenByteArray) == "FIXED_LEN_BYTE_ARRAY")
+
+@test
+fn test_each_repetition_and_each_annotation_has_its_own_name() [io]
+    test.case("three repetitions, three names")
+    let a = pqtype.repetition_name(PqRequired)
+    let b = pqtype.repetition_name(PqOptional)
+    let c = pqtype.repetition_name(PqRepeated)
+    test.assert(str.len(a) > 0)
+    test.assert(a != b)
+    test.assert(b != c)
+    test.assert(a != c)
+
+    test.case("a string and a date are named apart")
+    let s = pqtype.logical_name(PqLogString)
+    test.assert(str.len(s) > 0)
+    test.assert(s != pqtype.logical_name(PqLogDate))
+
+@test
+fn test_a_writer_emits_the_converted_type_an_annotation_promotes_from() [io]
+    test.case("STRING was UTF8 and DATE was DATE")
+    match pqtype.converted_of(PqLogString)
+        PqConvUtf8 => test.assert(true)
+        _          => test.assert(false)
+    match pqtype.converted_of(PqLogDate)
+        PqConvDate => test.assert(true)
+        _          => test.assert(false)
+
+    test.case("a microsecond timestamp not adjusted to UTC has no converted spelling at all")
+    match pqtype.converted_of(PqLogTimestamp(false, PqMicros))
+        PqConvNone => test.assert(true)
+        _          => test.assert(false)

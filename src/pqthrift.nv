@@ -215,27 +215,27 @@ pub fn writer() -> PqThriftWriter
 
 // A field header, using the shortest encoding the id delta allows.
 pub fn write_field(w: PqThriftWriter, id: Int, kind: PqThriftType,
-                   mut dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
+                   var dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
     todo("parquet-nv.pqthrift.write_field")
 
 // The stop byte, and the parent's field id restored.
-pub fn write_stop(w: PqThriftWriter, mut dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
+pub fn write_stop(w: PqThriftWriter, var dst: Cursor) -> Result<(PqThriftWriter, Int), PqFault>
     todo("parquet-nv.pqthrift.write_stop")
 
 // An unsigned varint.
-pub fn write_varint(value: Int, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_varint(value: Int, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqthrift.write_varint")
 
 // A zigzag varint.
-pub fn write_zigzag(value: Int, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_zigzag(value: Int, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqthrift.write_zigzag")
 
 // A length-prefixed binary field payload.
-pub fn write_binary(value: Bytes, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_binary(value: Bytes, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqthrift.write_binary")
 
 // A list header.
-pub fn write_list_header(element: PqThriftType, count: Int, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_list_header(element: PqThriftType, count: Int, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqthrift.write_list_header")
 
 // How many bytes an unsigned varint of this value takes.

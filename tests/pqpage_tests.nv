@@ -1,0 +1,236 @@
+// pqpage_tests.nv — the page header, the two data page versions, and
+// where each version puts its levels and its values.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE OFFSETS.  A page header is a thrift struct written
+// immediately before its payload, so the numbers that matter are where
+// the payload starts, how long the header was, and — for a v2 page —
+// where the uncompressed levels end and the values begin.  The headers
+// below are spelled in the compact protocol by hand, one field per
+// group of hex digits, so a reviewer can check them against
+// `parquet.thrift`: field 1 is the page type, 2 the uncompressed size,
+// 3 the compressed size, 5 the v1 data page header and 7 the
+// dictionary page header.
+
+use std.test
+use std.list
+use pqpage
+use arrowbuf
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// Statistics with nothing claimed, built rather than asked for, so a
+// test's first red names the call it is about.
+fn nothing_claimed() -> PqStats
+    PqStats { min_span: arrowbuf.buffer(0, 0), max_span: arrowbuf.buffer(0, 0), has_min: false,
+              has_max: false, min_value_span: arrowbuf.buffer(0, 0),
+              max_value_span: arrowbuf.buffer(0, 0), has_min_value: false, has_max_value: false,
+              null_count: 0, has_null_count: false, distinct_count: 0,
+              has_distinct_count: false, is_max_value_exact: false, is_min_value_exact: false }
+
+// A v1 data page of ten PLAIN values.
+fn v1_fields() -> PqDataPage
+    PqDataPage { num_values: 10, num_non_null: 0 - 1, num_rows: 0 - 1, encoding: PqPlain,
+                 definition_encoding: PqRle, repetition_encoding: PqRle, definition_len: 0,
+                 repetition_len: 0, is_compressed: true, stats: nothing_claimed(),
+                 has_stats: false }
+
+// A v2 data page whose four bytes of repetition and six of definition
+// sit before the values.
+fn v2_fields() -> PqDataPage
+    PqDataPage { num_values: 10, num_non_null: 8, num_rows: 4, encoding: PqPlain,
+                 definition_encoding: PqRle, repetition_encoding: PqRle, definition_len: 6,
+                 repetition_len: 4, is_compressed: true, stats: nothing_claimed(),
+                 has_stats: false }
+
+// A v2 page header with a hundred bytes of payload at 64.
+fn v2_header() -> PqPageHeader
+    PqPageHeader { kind: PqDataPageV2, compressed_size: 100, uncompressed_size: 200, crc: 0,
+                   has_crc: false, payload_at: 64, header_len: 20 }
+
+// An INT64 column with no nesting.
+fn qty() -> PqColumn
+    PqColumn { path: "qty", segments: ["qty"], physical: PqInt64, type_length: 0,
+               logical: PqLogNone, max_definition_level: 0, max_repetition_level: 0 }
+
+// Four bytes of something else, then an 18-byte v1 header:
+// type 0, uncompressed 100, compressed 60, and a data page header of
+// ten values, PLAIN, with RLE levels.
+fn v1_file() -> Bytes
+    hex("00000000" + "1500" + "15c801" + "1578" + "2c" + "1514" + "1500" + "1506" + "1506" + "00"
+        + "00")
+
+// A dictionary page header: type 2, forty bytes either way, and five
+// sorted PLAIN entries.
+fn dictionary_file() -> Bytes
+    hex("1504" + "1550" + "1550" + "4c" + "150a" + "1500" + "11" + "00" + "00")
+
+// ── Reading ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_header_says_where_its_payload_starts_and_how_long_it_was() [io]
+    match pqpage.read_header(v1_file(), 4)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            match h.kind
+                PqDataPageV1 => test.assert(true)
+                _            => test.assert(false)
+            test.assert_eq(h.uncompressed_size, 100)
+            test.assert_eq(h.compressed_size, 60)
+            test.assert(h.has_crc == false)
+
+            test.case("eighteen bytes of header, so the payload is at 4 + 18")
+            test.assert_eq(h.header_len, 18)
+            test.assert_eq(h.payload_at, 22)
+
+@test
+fn test_a_v1_data_page_has_no_stored_value_or_row_count() [io]
+    let h = PqPageHeader { kind: PqDataPageV1, compressed_size: 60, uncompressed_size: 100,
+                           crc: 0, has_crc: false, payload_at: 22, header_len: 18 }
+
+    match pqpage.read_data_page(v1_file(), h)
+        Err(_) => test.assert(false)
+        Ok(d)  =>
+            test.assert_eq(d.num_values, 10)
+            match d.encoding
+                PqPlain => test.assert(true)
+                _       => test.assert(false)
+
+            test.case("v1 records neither, which is why a v1 reader decodes levels first")
+            test.assert_eq(d.num_non_null, 0 - 1)
+            test.assert_eq(d.num_rows, 0 - 1)
+            test.assert(d.is_compressed)
+
+@test
+fn test_a_dictionary_page_counts_entries_and_may_claim_it_is_sorted() [io]
+    match pqpage.read_header(dictionary_file(), 0)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            match h.kind
+                PqDictionaryPage => test.assert(true)
+                _                => test.assert(false)
+            match pqpage.read_dictionary_header(dictionary_file(), h)
+                Err(_) => test.assert(false)
+                Ok(d)  =>
+                    test.assert_eq(d.num_values, 5)
+                    test.assert(d.is_sorted)
+
+@test
+fn test_the_payload_is_the_compressed_size_from_where_the_header_ended() [io]
+    let s = pqpage.payload_span(v2_header())
+    test.assert_eq(s.start, 64)
+    test.assert_eq(s.len, 100)
+
+@test
+fn test_a_v2_page_puts_its_uncompressed_levels_before_its_values() [io]
+    test.case("the levels are the first ten bytes: four of repetition, six of definition")
+    let l = pqpage.v2_level_span(v2_header(), v2_fields())
+    test.assert_eq(l.start, 64)
+    test.assert_eq(l.len, 10)
+
+    test.case("the values are the rest of the compressed size")
+    let v = pqpage.v2_values_span(v2_header(), v2_fields())
+    test.assert_eq(v.start, 74)
+    test.assert_eq(v.len, 90)
+
+@test
+fn test_a_page_crc_is_checked_only_when_asked() [io]
+    // CRC32 of "abc" is 0x352441c2
+    let src = bytes.from_str("abc")
+    let good = PqPageHeader { kind: PqDataPageV1, compressed_size: 3, uncompressed_size: 3,
+                              crc: 891568578, has_crc: true, payload_at: 0, header_len: 0 }
+    test.assert(pqpage.crc_matches(src, good))
+
+    let bad = PqPageHeader { kind: PqDataPageV1, compressed_size: 3, uncompressed_size: 3,
+                             crc: 1, has_crc: true, payload_at: 0, header_len: 0 }
+    test.assert(pqpage.crc_matches(src, bad) == false)
+
+@test
+fn test_a_page_that_contradicts_its_column_or_its_budget_is_reported() [io]
+    test.case("a PLAIN page of an INT64 column, under budget, contradicts nothing")
+    test.assert_eq(list.len(pqpage.check_page(v2_header(), v2_fields(), qty(), 1048576)), 0)
+
+    test.case("an uncompressed size past the caller's budget is reported")
+    test.assert(list.len(pqpage.check_page(v2_header(), v2_fields(), qty(), 100)) > 0)
+
+    test.case("an encoding the physical type does not allow is reported")
+    let wrong = PqDataPage { num_values: 10, num_non_null: 8, num_rows: 4,
+                             encoding: PqDeltaLengthByteArray, definition_encoding: PqRle,
+                             repetition_encoding: PqRle, definition_len: 6, repetition_len: 4,
+                             is_compressed: true, stats: nothing_claimed(), has_stats: false }
+    test.assert(list.len(pqpage.check_page(v2_header(), wrong, qty(), 1048576)) > 0)
+
+@test
+fn test_each_page_kind_has_its_own_name() [io]
+    let a = pqpage.page_kind_name(PqDataPageV1)
+    let b = pqpage.page_kind_name(PqDataPageV2)
+    let c = pqpage.page_kind_name(PqDictionaryPage)
+    let d = pqpage.page_kind_name(PqIndexPage)
+    test.assert(str.len(a) > 0)
+    test.assert(a != b)
+    test.assert(c != d)
+    test.assert(a != c)
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_written_v1_header_reads_back_and_fits_its_bound() [io]
+    var dst = room(64)
+
+    match pqpage.write_data_page_v1_header(v1_fields(), 60, 100, dst)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert(n <= pqpage.header_bound(PqDataPageV1, false))
+            match pqpage.read_header(dst.finish(), 0)
+                Err(_) => test.assert(false)
+                Ok(h)  =>
+                    test.assert_eq(h.compressed_size, 60)
+                    test.assert_eq(h.header_len, n)
+
+@test
+fn test_a_written_v2_header_carries_its_level_lengths() [io]
+    var dst = room(64)
+
+    match pqpage.write_data_page_v2_header(v2_fields(), 100, 200, dst)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert(n <= pqpage.header_bound(PqDataPageV2, false))
+            let src = dst.finish()
+            match pqpage.read_header(src, 0)
+                Err(_) => test.assert(false)
+                Ok(h)  =>
+                    match pqpage.read_data_page(src, h)
+                        Err(_) => test.assert(false)
+                        Ok(d)  =>
+                            test.assert_eq(d.definition_len, 6)
+                            test.assert_eq(d.repetition_len, 4)
+
+@test
+fn test_a_written_dictionary_header_counts_its_entries() [io]
+    var dst = room(64)
+    let entries = PqDictionaryHeader { num_values: 5, encoding: PqPlain, is_sorted: false }
+
+    match pqpage.write_dictionary_header(entries, 40, 40, dst)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert(n <= pqpage.header_bound(PqDictionaryPage, false))
+            let src = dst.finish()
+            match pqpage.read_header(src, 0)
+                Err(_) => test.assert(false)
+                Ok(h)  =>
+                    match pqpage.read_dictionary_header(src, h)
+                        Ok(d)  => test.assert_eq(d.num_values, 5)
+                        Err(_) => test.assert(false)
+
+@test
+fn test_a_header_with_statistics_needs_more_room_than_one_without() [io]
+    test.assert(pqpage.header_bound(PqDataPageV1, true)
+                > pqpage.header_bound(PqDataPageV1, false))

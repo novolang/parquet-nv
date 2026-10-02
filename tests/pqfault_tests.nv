@@ -1,0 +1,126 @@
+// pqfault_tests.nv — where a fault was found, and which of the three
+// kinds a caller reacts to.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE REACTIONS.  An incomplete range is asked for
+// again, corrupt bytes are reported against the file, and an
+// unavailable codec is reported against this build.  A fault in the
+// wrong kind sends a person to the wrong place, so each kind is
+// asserted from a variant the module's header assigns to it.
+
+use std.test
+use pqfault
+
+// A position naming a page, built rather than asked for, so a test's
+// first red names the call it is about.
+fn a_page() -> PqWhere
+    PqWhere { row_group: 3, path: "orders.items.price", page: 11, at: 4194304 }
+
+// The position for a value nobody read.
+fn nowhere() -> PqWhere
+    PqWhere { row_group: 0 - 1, path: "", page: 0 - 1, at: 0 - 1 }
+
+@test
+fn test_a_position_carries_only_the_coordinates_it_has() [io]
+    test.case("a footer position has a byte offset and no column")
+    let f = pqfault.in_footer(120)
+    test.assert_eq(f.row_group, 0 - 1)
+    test.assert_eq(f.path, "")
+    test.assert_eq(f.page, 0 - 1)
+    test.assert_eq(f.at, 120)
+
+    test.case("a chunk position names the row group and the dotted path, not a page")
+    let c = pqfault.in_chunk(3, "orders.items.price", 4096)
+    test.assert_eq(c.row_group, 3)
+    test.assert_eq(c.path, "orders.items.price")
+    test.assert_eq(c.page, 0 - 1)
+    test.assert_eq(c.at, 4096)
+
+    test.case("a page position names all four")
+    let p = pqfault.in_page(3, "orders.items.price", 11, 8192)
+    test.assert_eq(p.page, 11)
+    test.assert_eq(p.at, 8192)
+
+    test.case("and a value the caller built has none of them")
+    let n = pqfault.no_where()
+    test.assert_eq(n.row_group, 0 - 1)
+    test.assert_eq(n.path, "")
+    test.assert_eq(n.page, 0 - 1)
+    test.assert_eq(n.at, 0 - 1)
+
+@test
+fn test_a_file_too_short_for_a_footer_names_its_length() [io]
+    match pqfault.too_short(3)
+        PqTooShort(len, _) => test.assert_eq(len, 3)
+        _                  => test.assert(false)
+
+@test
+fn test_a_short_range_is_incomplete_and_more_bytes_may_cure_it() [io]
+    let f = PqRangeShort(100, 40, a_page())
+
+    match pqfault.kind_of(f)
+        PqIncomplete => test.assert(true)
+        _            => test.assert(false)
+    test.assert(pqfault.is_incomplete(f))
+    test.assert(pqfault.is_corrupt(f) == false)
+    test.assert(pqfault.is_unavailable(f) == false)
+
+@test
+fn test_a_missing_codec_is_unavailable_and_not_corrupt() [io]
+    let f = PqCodecUnavailable("SNAPPY", a_page())
+
+    match pqfault.kind_of(f)
+        PqUnavailable => test.assert(true)
+        _             => test.assert(false)
+    test.assert(pqfault.is_unavailable(f))
+    test.assert(pqfault.is_corrupt(f) == false)
+    test.assert(pqfault.is_incomplete(f) == false)
+
+@test
+fn test_a_level_past_its_maximum_is_corrupt() [io]
+    let f = PqLevelOutOfRange(4, 3, a_page())
+
+    match pqfault.kind_of(f)
+        PqCorrupt => test.assert(true)
+        _         => test.assert(false)
+    test.assert(pqfault.is_unavailable(f) == false)
+
+@test
+fn test_a_fault_answers_where_it_was_found() [io]
+    let w = pqfault.where_of(PqDictionaryMissing(a_page()))
+    test.assert_eq(w.row_group, 3)
+    test.assert_eq(w.path, "orders.items.price")
+    test.assert_eq(w.page, 11)
+
+@test
+fn test_a_position_as_text_leaves_the_absent_coordinates_out() [io]
+    test.case("the path is the half a person acts on, so it is in the line")
+    test.assert(str.contains(pqfault.where_text(a_page()), "orders.items.price"))
+
+    test.case("and a coordinate that is -1 is not printed as -1")
+    test.assert(str.contains(pqfault.where_text(nowhere()), "-1") == false)
+
+@test
+fn test_each_kind_has_its_own_name() [io]
+    let a = pqfault.kind_name(PqIncomplete)
+    let b = pqfault.kind_name(PqCorrupt)
+    let c = pqfault.kind_name(PqUnavailable)
+    test.assert(str.len(a) > 0)
+    test.assert(a != b)
+    test.assert(b != c)
+    test.assert(a != c)
+
+@test
+fn test_a_fault_from_a_page_decoder_can_be_re_pointed_at_its_column() [io]
+    let caught = PqValueCountWrong(100, 99, nowhere())
+    let named = pqfault.in_column(caught, 2, "orders.items.price")
+    let w = pqfault.where_of(named)
+
+    test.case("the column is the caller's")
+    test.assert_eq(w.row_group, 2)
+    test.assert_eq(w.path, "orders.items.price")
+
+    test.case("and the fault itself is the same kind as before")
+    test.assert(pqfault.is_corrupt(named) == pqfault.is_corrupt(caught))

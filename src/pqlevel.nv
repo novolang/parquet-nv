@@ -196,11 +196,11 @@ pub fn flat_levels(count: Int) -> PqLevels
 
 // A definition stream, written into a cursor with the RLE/bit-packed
 // hybrid encoding at the column's own bit width.
-pub fn write_definitions(levels: [Int], c: PqColumn, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_definitions(levels: [Int], c: PqColumn, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqlevel.write_definitions")
 
 // A repetition stream, likewise.
-pub fn write_repetitions(levels: [Int], c: PqColumn, mut dst: Cursor) -> Result<Int, PqFault>
+pub fn write_repetitions(levels: [Int], c: PqColumn, var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqlevel.write_repetitions")
 
 // An upper bound on the bytes a level stream of this many entries

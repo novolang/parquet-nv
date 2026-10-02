@@ -195,17 +195,17 @@ pub fn page_kind_name(k: PqPageKind) -> Str
 // exist in production.  `write_data_page_v2_header` is published beside
 // it for a caller that knows its consumers.
 pub fn write_data_page_v1_header(d: PqDataPage, compressed_size: Int, uncompressed_size: Int,
-                                 mut dst: Cursor) -> Result<Int, PqFault>
+                                 var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqpage.write_data_page_v1_header")
 
 // A v2 data page header.
 pub fn write_data_page_v2_header(d: PqDataPage, compressed_size: Int, uncompressed_size: Int,
-                                 mut dst: Cursor) -> Result<Int, PqFault>
+                                 var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqpage.write_data_page_v2_header")
 
 // A dictionary page header.
 pub fn write_dictionary_header(h: PqDictionaryHeader, compressed_size: Int, uncompressed_size: Int,
-                               mut dst: Cursor) -> Result<Int, PqFault>
+                               var dst: Cursor) -> Result<Int, PqFault>
     todo("parquet-nv.pqpage.write_dictionary_header")
 
 // An upper bound on a page header's size.

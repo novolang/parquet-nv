@@ -217,7 +217,7 @@ pub fn pages_of(body: Bytes, body_at: Int, c: PqColumnChunk) -> Result<[PqPageHe
 // page is the cost dictionary encoding exists to avoid.
 pub fn dictionary_of(body: Bytes, body_at: Int, c: PqColumnChunk, col: PqColumn,
                      supplied: [PqDecompressor], cfg: PqCodecConfig,
-                     mut dst: Cursor) -> Result<[arrowbuf.ArrowBuffer], PqFault>
+                     var dst: Cursor) -> Result<[arrowbuf.ArrowBuffer], PqFault>
     todo("parquet-nv.pqread.dictionary_of")
 
 // One data page, decompressed into a cursor the caller sized, with its
@@ -229,7 +229,7 @@ pub fn dictionary_of(body: Bytes, body_at: Int, c: PqColumnChunk, col: PqColumn,
 // its own cursor.
 pub fn read_page(body: Bytes, body_at: Int, h: PqPageHeader, d: PqDataPage, c: PqColumnChunk,
                  col: PqColumn, supplied: [PqDecompressor], cfg: PqCodecConfig,
-                 mut dst: Cursor) -> Result<(Int, PqLevels, arrowbuf.ArrowBuffer), PqFault>
+                 var dst: Cursor) -> Result<(Int, PqLevels, arrowbuf.ArrowBuffer), PqFault>
     todo("parquet-nv.pqread.read_page")
 
 // An upper bound on the scratch buffer a chunk's largest page needs.

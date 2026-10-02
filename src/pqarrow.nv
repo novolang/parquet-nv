@@ -137,7 +137,7 @@ pub fn unmappable_columns(s: PqSchema) -> [Str]
 // and not the value count — a third number, and the one Arrow's
 // `length` field wants.
 pub fn levels_to_offsets(page: Bytes, l: PqLevels, c: PqColumn,
-                         mut dst: Cursor) -> Result<(Int, Int), PqFault>
+                         var dst: Cursor) -> Result<(Int, Int), PqFault>
     todo("parquet-nv.pqarrow.levels_to_offsets")
 
 // A page's definition and repetition levels from an Arrow array's
@@ -163,7 +163,7 @@ pub fn offsets_to_levels(body: Bytes, a: arrowcol.ArrowArray,
 // independent.
 pub fn chunk_to_array(body: Bytes, body_at: Int, chunk: PqColumnChunk, col: PqColumn,
                       supplied: [PqDecompressor], cfg: PqCodecConfig,
-                      mut dst: Cursor) -> Result<(arrowcol.ArrowArray, Int), PqFault>
+                      var dst: Cursor) -> Result<(arrowcol.ArrowArray, Int), PqFault>
     todo("parquet-nv.pqarrow.chunk_to_array")
 
 // A whole row group as an Arrow record batch.
@@ -174,7 +174,7 @@ pub fn chunk_to_array(body: Bytes, body_at: Int, chunk: PqColumnChunk, col: PqCo
 // IPC message, which is the conversion a notebook actually performs.
 pub fn row_group_to_batch(body: Bytes, body_at: Int, m: PqFileMeta, row_group: Int, paths: [Str],
                           supplied: [PqDecompressor], cfg: PqCodecConfig,
-                          mut dst: Cursor) -> Result<(arrowcol.ArrowBatch, Int), PqFault>
+                          var dst: Cursor) -> Result<(arrowcol.ArrowBatch, Int), PqFault>
     todo("parquet-nv.pqarrow.row_group_to_batch")
 
 // How large a body a row group's projected columns will need in Arrow's
@@ -194,14 +194,14 @@ pub fn batch_body_bound(m: PqFileMeta, row_group: Int, paths: [Str]) -> Result<I
 // a latency decision: small pages make a predicate push-down precise
 // and make the page index large.
 pub fn array_to_chunk(w: PqWriter, body: Bytes, a: arrowcol.ArrowArray, col: PqColumn,
-                      rows_per_page: Int, buf: PqPageBuf, mut scratch: Cursor,
-                      mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                      rows_per_page: Int, buf: PqPageBuf, var scratch: Cursor,
+                      var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqarrow.array_to_chunk")
 
 // An Arrow record batch written as one row group.
 pub fn batch_to_row_group(w: PqWriter, body: Bytes, b: arrowcol.ArrowBatch, rows_per_page: Int,
-                          buf: PqPageBuf, mut scratch: Cursor,
-                          mut dst: Cursor) -> Result<(PqWriter, Int), PqFault>
+                          buf: PqPageBuf, var scratch: Cursor,
+                          var dst: Cursor) -> Result<(PqWriter, Int), PqFault>
     todo("parquet-nv.pqarrow.batch_to_row_group")
 
 // ── The Arrow schema a file carries in its footer ───────────────────

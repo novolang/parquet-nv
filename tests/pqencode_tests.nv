@@ -1,0 +1,328 @@
+// pqencode_tests.nv — the value encodings, read and written, with every
+// input spelled out in hex.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE LAYOUTS.  A Parquet decoder goes wrong by a few
+// bytes rather than by a wrong value: a boolean read as a byte, a
+// dictionary index stream read with the level framing, a byte array
+// read without its length.  So each case below is a buffer whose layout
+// the comment beside it names, and the assertion is the value at a
+// position a decoder that got the layout wrong would not find.
+//
+// The delta streams use one block of 128 values in four miniblocks,
+// and every miniblock has bit width zero, so a stream is its header,
+// one zigzag minimum delta and four zero widths: `8001 04 <count>
+// <first> <min delta> 00000000`.
+
+use std.test
+use std.list
+use pqencode
+use arrowbuf
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// A span over the whole of a buffer.
+fn whole(b: Bytes) -> arrowbuf.ArrowBuffer
+    arrowbuf.buffer(0, bytes.len(b))
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// The first `n` bytes a cursor holds, in hex.
+fn landed(var c: Cursor, n: Int) -> Str
+    bytes.to_hex(bytes.slice(c.finish(), 0, n))
+
+// ── Codes and names ─────────────────────────────────────────────────
+
+@test
+fn test_an_encoding_code_is_the_formats_own_number() [io]
+    test.case("0 is PLAIN and 5 is DELTA_BINARY_PACKED")
+    match pqencode.encoding_of_code(0)
+        Ok(PqPlain) => test.assert(true)
+        _           => test.assert(false)
+    match pqencode.encoding_of_code(5)
+        Ok(PqDeltaBinaryPacked) => test.assert(true)
+        _                       => test.assert(false)
+
+    test.case("and the other direction answers the same numbers")
+    test.assert_eq(pqencode.encoding_code(PqPlain), 0)
+    test.assert_eq(pqencode.encoding_code(PqRle), 3)
+    test.assert_eq(pqencode.encoding_code(PqByteStreamSplit), 9)
+
+    test.case("the name is the format's spelling")
+    test.assert_eq(pqencode.encoding_name(PqDeltaBinaryPacked), "DELTA_BINARY_PACKED")
+    test.assert_eq(pqencode.encoding_name(PqPlain), "PLAIN")
+
+// ── PLAIN ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_plain_size_is_a_bit_per_boolean_and_a_width_per_anything_else() [io]
+    test.case("a thousand booleans are 125 bytes, not a thousand")
+    match pqencode.plain_size(PqBoolean, 0, 1000)
+        Ok(n)  => test.assert_eq(n, 125)
+        Err(_) => test.assert(false)
+
+    test.case("nine booleans round up to two bytes")
+    match pqencode.plain_size(PqBoolean, 0, 9)
+        Ok(n)  => test.assert_eq(n, 2)
+        Err(_) => test.assert(false)
+
+    test.case("ten INT32 are forty bytes, two INT96 are twenty-four")
+    match pqencode.plain_size(PqInt32, 0, 10)
+        Ok(n)  => test.assert_eq(n, 40)
+        Err(_) => test.assert(false)
+    match pqencode.plain_size(PqInt96, 0, 2)
+        Ok(n)  => test.assert_eq(n, 24)
+        Err(_) => test.assert(false)
+
+    test.case("a FIXED_LEN_BYTE_ARRAY is its type length per value")
+    match pqencode.plain_size(PqFixedLenByteArray, 16, 3)
+        Ok(n)  => test.assert_eq(n, 48)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_plain_integer_is_little_endian_and_a_boolean_is_a_bit() [io]
+    // INT32 7, then INT32 -2
+    let ints = hex("07000000feffffff")
+
+    test.case("element 1 of two INT32 values")
+    match pqencode.plain_int_at(ints, whole(ints), PqInt32, 1)
+        Ok(v)  => test.assert_eq(v, 0 - 2)
+        Err(_) => test.assert(false)
+
+    // 0x05 = bits 1, 0, 1, LSB first
+    let bools = hex("05")
+
+    test.case("element 2 of a boolean page is bit 2 of byte 0")
+    match pqencode.plain_int_at(bools, whole(bools), PqBoolean, 2)
+        Ok(v)  => test.assert_eq(v, 1)
+        Err(_) => test.assert(false)
+    match pqencode.plain_int_at(bools, whole(bools), PqBoolean, 1)
+        Ok(v)  => test.assert_eq(v, 0)
+        Err(_) => test.assert(false)
+
+    test.case("an index past the span is refused")
+    match pqencode.plain_int_at(ints, whole(ints), PqInt32, 2)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_plain_float_is_its_ieee_bytes_little_endian() [io]
+    // DOUBLE 1.5
+    let d = hex("000000000000f83f")
+    match pqencode.plain_float_at(d, whole(d), PqDouble, 0)
+        Ok(v)  => test.assert_eq(v, 1.5)
+        Err(_) => test.assert(false)
+
+    // FLOAT 1.5, FLOAT 2.0
+    let f = hex("0000c03f00000040")
+    match pqencode.plain_float_at(f, whole(f), PqFloat, 1)
+        Ok(v)  => test.assert_eq(v, 2.0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_plain_byte_array_is_a_length_then_its_bytes_and_found_by_a_scan() [io]
+    // "hi" behind length 2, then "abc" behind length 3
+    let page = hex("020000006869" + "03000000616263")
+
+    test.case("element 1 starts after the first value and the second length")
+    match pqencode.plain_byte_array_at(page, whole(page), 1)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert_eq(s.start, 10)
+            test.assert_eq(s.len, 3)
+
+    test.case("the one-walk form answers every span")
+    match pqencode.plain_byte_array_spans(page, whole(page), 2)
+        Err(_) => test.assert(false)
+        Ok(ss) =>
+            test.assert_eq(list.len(ss), 2)
+            test.assert_eq(ss[0].start, 4)
+            test.assert_eq(ss[0].len, 2)
+
+    test.case("a length that runs past the span is refused")
+    let cut = hex("09000000686869")
+    match pqencode.plain_byte_array_at(cut, whole(cut), 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_fixed_length_byte_array_is_random_access() [io]
+    match pqencode.plain_fixed_at(arrowbuf.buffer(100, 48), 16, 2)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.assert_eq(s.start, 132)
+            test.assert_eq(s.len, 16)
+
+// ── RLE / bit-packed hybrid ─────────────────────────────────────────
+
+@test
+fn test_a_run_length_run_is_a_count_and_one_value() [io]
+    // header 0a = 5 << 1, a run-length run of five; value byte 05
+    let page = hex("0a05")
+
+    match pqencode.rle_runs(page, whole(page), 3, 5)
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert_eq(list.len(rs), 1)
+            test.assert(rs[0].is_packed == false)
+            test.assert_eq(rs[0].count, 5)
+            test.assert_eq(rs[0].value, 5)
+
+@test
+fn test_a_bit_packed_run_is_groups_of_eight_values() [io]
+    // header 03 = (1 << 1) | 1, one group; values 3, 2, 0, 1, 3 at two bits
+    let page = hex("034b03")
+
+    match pqencode.rle_runs(page, whole(page), 2, 5)
+        Err(_) => test.assert(false)
+        Ok(rs) =>
+            test.assert_eq(list.len(rs), 1)
+            test.assert(rs[0].is_packed)
+
+@test
+fn test_a_level_stream_has_a_length_prefix_and_an_index_stream_has_a_width_byte() [io]
+    test.case("levels: four bytes of length, then the run")
+    let levels = hex("020000000a05")
+    match pqencode.rle_decode_levels(levels, 0, 3, 5)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(list.len(p.0), 5)
+            test.assert_eq(p.0[4], 5)
+
+    test.case("indices: one byte of bit width, then the run, and no length")
+    let indices = hex("020a03")
+    match pqencode.rle_decode_indices(indices, whole(indices), 5)
+        Err(_) => test.assert(false)
+        Ok(xs) =>
+            test.assert_eq(list.len(xs), 5)
+            test.assert_eq(xs[0], 3)
+
+    test.case("the width is the stream's first byte")
+    match pqencode.rle_index_bit_width(indices, whole(indices))
+        Ok(w)  => test.assert_eq(w, 2)
+        Err(_) => test.assert(false)
+
+// ── The delta encodings ─────────────────────────────────────────────
+
+@test
+fn test_a_delta_stream_of_a_run_of_integers_is_its_first_value_and_one_delta() [io]
+    // count 5, first zigzag(1) = 02, min delta zigzag(1) = 02
+    let page = hex("8001040502" + "0200000000")
+
+    match pqencode.delta_binary_decode(page, whole(page), 5)
+        Err(_) => test.assert(false)
+        Ok(xs) =>
+            test.assert_eq(list.len(xs), 5)
+            test.assert_eq(xs[0], 1)
+            test.assert_eq(xs[4], 5)
+
+@test
+fn test_delta_length_byte_arrays_are_lengths_then_one_run_of_bytes() [io]
+    // lengths 2, 3: first zigzag(2) = 04, min delta zigzag(1) = 02;
+    // then "hi" and "abc" with no separators
+    let page = hex("8001040204" + "0200000000" + "6869616263")
+
+    match pqencode.delta_length_decode(page, whole(page), 2)
+        Err(_) => test.assert(false)
+        Ok(ss) =>
+            test.assert_eq(list.len(ss), 2)
+            test.assert_eq(ss[0].start, 10)
+            test.assert_eq(ss[0].len, 2)
+            test.assert_eq(ss[1].start, 12)
+            test.assert_eq(ss[1].len, 3)
+
+@test
+fn test_a_delta_byte_array_value_is_a_prefix_of_the_previous_one_plus_a_suffix() [io]
+    // prefix lengths 0, 2: first 00, min delta zigzag(2) = 04
+    // suffix lengths 3, 1: first zigzag(3) = 06, min delta zigzag(-2) = 03
+    // suffixes "abc" and "d", so the values are "abc" and "abd"
+    let page = hex("8001040200" + "0400000000" + "8001040206" + "0300000000" + "61626364")
+
+    match pqencode.delta_byte_array_decode(page, whole(page), 2)
+        Err(_) => test.assert(false)
+        Ok(vs) =>
+            test.assert_eq(list.len(vs), 2)
+            test.assert_eq(bytes.to_str(vs[0]), "abc")
+            test.assert_eq(bytes.to_str(vs[1]), "abd")
+
+// ── BYTE_STREAM_SPLIT ───────────────────────────────────────────────
+
+@test
+fn test_byte_stream_split_is_a_transpose_back_to_plain() [io]
+    // FLOAT 1.5 = 0000c03f and 2.0 = 00000040, as four streams of two bytes
+    let page = hex("0000" + "0000" + "c000" + "3f40")
+    var dst = room(8)
+
+    match pqencode.byte_stream_split_into(page, whole(page), 4, 2, dst)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.assert_eq(n, 8)
+            test.assert_eq(landed(dst, 8), "0000c03f00000040")
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+@test
+fn test_plain_writes_are_the_layouts_the_reader_reads() [io]
+    test.case("two INT32 are eight little-endian bytes")
+    var a = room(16)
+    match pqencode.plain_write_ints([7, 0 - 2], PqInt32, a)
+        Ok(n)  =>
+            test.assert_eq(n, 8)
+            test.assert_eq(landed(a, 8), "07000000feffffff")
+        Err(_) => test.assert(false)
+
+    test.case("a DOUBLE is eight bytes")
+    var b = room(16)
+    match pqencode.plain_write_floats([1.5], PqDouble, b)
+        Ok(n)  =>
+            test.assert_eq(n, 8)
+            test.assert_eq(landed(b, 8), "000000000000f83f")
+        Err(_) => test.assert(false)
+
+    test.case("three booleans are one byte, LSB first")
+    var c = room(4)
+    match pqencode.plain_write_bools([true, false, true], c)
+        Ok(n)  =>
+            test.assert_eq(n, 1)
+            test.assert_eq(landed(c, 1), "05")
+        Err(_) => test.assert(false)
+
+    test.case("a byte array is its four-byte length and then its bytes")
+    var d = room(16)
+    match pqencode.plain_write_byte_arrays([bytes.from_str("hi")], d)
+        Ok(n)  =>
+            test.assert_eq(n, 6)
+            test.assert_eq(landed(d, 6), "020000006869")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_two_hybrid_framings_are_written_as_they_are_read() [io]
+    test.case("an index stream starts with its bit width")
+    var a = room(32)
+    match pqencode.rle_write_indices([3, 3, 3, 3, 3], 2, a)
+        Ok(n)  =>
+            test.assert(n > 1)
+            test.assert_eq(landed(a, 1), "02")
+        Err(_) => test.assert(false)
+
+    test.case("a level stream starts with a four-byte length of what follows")
+    var b = room(32)
+    match pqencode.rle_write_levels([1, 1, 0, 1, 1], 1, b)
+        Ok(n)  =>
+            test.assert(n > 4)
+            test.assert_eq(bytes.to_hex(bytes.slice(b.finish(), 1, 4)), "000000")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_hybrid_bound_covers_every_value_bit_packed() [io]
+    test.case("eight one-bit values: a header byte and a byte of bits")
+    test.assert(pqencode.rle_bound(8, 1) >= 2)
+
+    test.case("a thousand three-bit values: at least 375 bytes of bits")
+    test.assert(pqencode.rle_bound(1000, 3) >= 375)

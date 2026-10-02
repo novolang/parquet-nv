@@ -1,0 +1,369 @@
+// pqthrift_tests.nv — the compact-protocol subset: field headers whose
+// id is a delta, varints that are zigzagged and varints that are not,
+// and booleans that carry their value in the type nibble.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: parquet-nv.<module>.<fn>`.
+//
+// THE CASES ARE THE BYTES.  Each input below is written out in hex from
+// the compact-protocol specification, so a reviewer can check a case
+// against the specification without running anything: `15` is field 1
+// of type `I32`, `01` is the zigzag spelling of -1, `ac02` is the
+// varint 300.
+
+use std.test
+use std.list
+use pqthrift
+use pqfault
+
+// A cursor at the start of a buffer, with no field read yet.
+fn start() -> PqThriftCursor
+    PqThriftCursor { at: 0, last_field_id: 0, stack: [] }
+
+// A writer at the start of a struct, built rather than asked for, so a
+// test's first red names the call it is about.
+fn fresh_writer() -> PqThriftWriter
+    PqThriftWriter { written: 0, last_field_id: 0, stack: [] }
+
+// The bytes a hex string spells.
+fn hex(text: Str) -> Bytes
+    bytes.from_hex(text) ?? bytes.zeros(0)
+
+// A destination with room for `n` bytes.
+fn room(n: Int) -> Cursor
+    bytes.cursor_le(bytes.zeros(n))
+
+// The first `n` bytes a cursor holds, in hex.
+fn landed(var c: Cursor, n: Int) -> Str
+    bytes.to_hex(bytes.slice(c.finish(), 0, n))
+
+// ── Reading ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_cursor_starts_where_it_is_told_with_no_previous_field() [io]
+    let c = pqthrift.cursor(12)
+
+    test.case("the position is the caller's")
+    test.assert_eq(c.at, 12)
+
+    test.case("and the delta chain starts at zero, with nothing to restore")
+    test.assert_eq(c.last_field_id, 0)
+    test.assert_eq(list.len(c.stack), 0)
+
+@test
+fn test_a_field_id_is_a_delta_from_the_previous_field() [io]
+    // field 1 i32 = 2, field 3 i32 = 3, stop
+    let src = hex("1504250600")
+
+    test.case("a one-byte header: delta 1, type I32, so field 1")
+    match pqthrift.read_field(src, start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1.id, 1)
+            match p.1.kind
+                PqThriftI32 => test.assert(true)
+                _           => test.assert(false)
+            test.assert_eq(p.1.at, 1)
+
+            test.case("the value is a zigzag varint, so 04 is 2")
+            match pqthrift.read_i32(src, p.0)
+                Err(_) => test.assert(false)
+                Ok(v)  =>
+                    test.assert_eq(v.1, 2)
+
+                    test.case("the next header's delta 2 is added to 1, so field 3")
+                    match pqthrift.read_field(src, v.0)
+                        Err(_) => test.assert(false)
+                        Ok(q)  => test.assert_eq(q.1.id, 3)
+
+@test
+fn test_the_end_of_a_struct_is_a_stop_field_and_not_a_fault() [io]
+    let src = hex("00")
+
+    match pqthrift.read_field(src, start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            match p.1.kind
+                PqThriftStop => test.assert(true)
+                _            => test.assert(false)
+
+@test
+fn test_a_nested_struct_starts_its_own_delta_chain_and_the_parent_resumes() [io]
+    let at_field_four = PqThriftCursor { at: 9, last_field_id: 4, stack: [] }
+
+    test.case("entering resets the previous id and pushes the parent's")
+    let inner = pqthrift.enter_struct(at_field_four)
+    test.assert_eq(inner.last_field_id, 0)
+    test.assert_eq(list.len(inner.stack), 1)
+
+    test.case("leaving restores it, so the parent's next delta counts from 4")
+    match pqthrift.leave_struct(inner)
+        Err(_) => test.assert(false)
+        Ok(c)  =>
+            test.assert_eq(c.last_field_id, 4)
+            test.assert_eq(list.len(c.stack), 0)
+
+    test.case("leaving a struct that was never entered is refused")
+    match pqthrift.leave_struct(start())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_unknown_field_is_stepped_over_by_its_type() [io]
+    // field 1 binary "abc", then field 2 i32 = 1
+    let src = hex("1803616263150200")
+
+    match pqthrift.read_field(src, start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("a binary field is its length varint and that many bytes")
+            match pqthrift.skip_field(src, p.0, p.1.kind)
+                Err(_) => test.assert(false)
+                Ok(c)  =>
+                    test.assert_eq(c.at, 5)
+
+                    test.case("and the next header still resolves against the skipped id")
+                    match pqthrift.read_field(src, c)
+                        Err(_) => test.assert(false)
+                        Ok(q)  => test.assert_eq(q.1.id, 2)
+
+@test
+fn test_signed_integers_are_zigzagged_and_lengths_are_not() [io]
+    test.case("01 is -1 as a zigzag, which is the point of zigzag")
+    match pqthrift.read_zigzag(hex("01"), start())
+        Ok(p)  =>
+            test.assert_eq(p.1, 0 - 1)
+            test.assert_eq(p.0.at, 1)
+        Err(_) => test.assert(false)
+
+    test.case("and 03 is -2, 02 is 1")
+    match pqthrift.read_zigzag(hex("03"), start())
+        Ok(p)  => test.assert_eq(p.1, 0 - 2)
+        Err(_) => test.assert(false)
+    match pqthrift.read_zigzag(hex("02"), start())
+        Ok(p)  => test.assert_eq(p.1, 1)
+        Err(_) => test.assert(false)
+
+    test.case("an unsigned varint is read as it is: ac02 is 300 in two bytes")
+    match pqthrift.read_varint(hex("ac02"), start())
+        Ok(p)  =>
+            test.assert_eq(p.1, 300)
+            test.assert_eq(p.0.at, 2)
+        Err(_) => test.assert(false)
+
+    test.case("a varint that does not terminate within ten bytes is refused")
+    match pqthrift.read_varint(hex("ffffffffffffffffffffff"), start())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pqfault.is_corrupt(f))
+
+@test
+fn test_the_integer_fields_are_zigzag_varints_of_either_width() [io]
+    test.case("an i32 of -3 is the single byte 05")
+    match pqthrift.read_i32(hex("05"), start())
+        Ok(p)  => test.assert_eq(p.1, 0 - 3)
+        Err(_) => test.assert(false)
+
+    test.case("an i64 of 1000000 is three bytes, not eight")
+    match pqthrift.read_i64(hex("80897a"), start())
+        Ok(p)  =>
+            test.assert_eq(p.1, 1000000)
+            test.assert_eq(p.0.at, 3)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_double_is_eight_little_endian_bytes_and_no_varint() [io]
+    match pqthrift.read_double(hex("000000000000f83f"), start())
+        Ok(p)  =>
+            test.assert_eq(p.1, 1.5)
+            test.assert_eq(p.0.at, 8)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_binary_field_is_a_span_and_a_string_is_its_copy() [io]
+    let src = hex("05686f75727332")
+
+    test.case("the span starts after the length byte and covers the five bytes")
+    match pqthrift.read_binary_span(src, start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1.start, 1)
+            test.assert_eq(p.1.len, 5)
+            test.assert_eq(p.0.at, 6)
+
+    test.case("the same field copied out as a Str")
+    match pqthrift.read_str(src, start())
+        Ok(p)  => test.assert_eq(p.1, "hours")
+        Err(_) => test.assert(false)
+
+    test.case("a length that runs past the buffer is refused before it is used")
+    match pqthrift.read_binary_span(hex("0961"), start())
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pqfault.is_corrupt(f))
+
+@test
+fn test_a_boolean_field_has_its_value_in_the_header_and_no_payload() [io]
+    let src = hex("1112")
+
+    match pqthrift.read_field(src, start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("type 1 is true")
+            test.assert(pqthrift.read_bool(p.1))
+
+            test.case("and the next header is the very next byte")
+            test.assert_eq(p.0.at, 1)
+            match pqthrift.read_field(src, p.0)
+                Err(_) => test.assert(false)
+                Ok(q)  =>
+                    test.case("type 2 is false")
+                    test.assert(pqthrift.read_bool(q.1) == false)
+                    test.assert_eq(q.1.id, 2)
+
+@test
+fn test_a_boolean_inside_a_list_does_have_a_payload_byte() [io]
+    match pqthrift.read_list_bool(hex("01"), start())
+        Ok(p)  =>
+            test.assert(p.1)
+            test.assert_eq(p.0.at, 1)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_list_header_holds_a_short_count_in_its_nibble_and_a_long_one_after() [io]
+    test.case("35 is three I32 elements in one byte")
+    match pqthrift.read_list_header(hex("35"), start())
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1.count, 3)
+            match p.1.element
+                PqThriftI32 => test.assert(true)
+                _           => test.assert(false)
+            test.assert_eq(p.0.at, 1)
+
+    test.case("f5 14 is twenty, because a nibble of 15 moves the count to a varint")
+    match pqthrift.read_list_header(hex("f514"), start())
+        Ok(p)  =>
+            test.assert_eq(p.1.count, 20)
+            test.assert_eq(p.0.at, 2)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_type_code_names_a_wire_type_or_is_refused() [io]
+    test.case("5 is I32 and 12 is STRUCT")
+    match pqthrift.type_of_code(5)
+        Ok(PqThriftI32) => test.assert(true)
+        _               => test.assert(false)
+    match pqthrift.type_of_code(12)
+        Ok(PqThriftStruct) => test.assert(true)
+        _                  => test.assert(false)
+
+    test.case("13 is not a compact-protocol type")
+    match pqthrift.type_of_code(13)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(pqfault.is_corrupt(f))
+
+    test.case("every type has a name, and two types have two")
+    test.assert(str.len(pqthrift.type_name(PqThriftI32)) > 0)
+    test.assert(pqthrift.type_name(PqThriftI32) != pqthrift.type_name(PqThriftI64))
+
+// ── Writing ─────────────────────────────────────────────────────────
+
+@test
+fn test_a_writer_starts_with_nothing_written_and_no_previous_field() [io]
+    let w = pqthrift.writer()
+    test.assert_eq(w.written, 0)
+    test.assert_eq(w.last_field_id, 0)
+    test.assert_eq(list.len(w.stack), 0)
+
+@test
+fn test_a_field_header_is_one_byte_when_the_delta_fits_a_nibble() [io]
+    var dst = room(8)
+
+    test.case("field 1 of type I32 is the single byte 15")
+    match pqthrift.write_field(fresh_writer(), 1, PqThriftI32, dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1, 1)
+            test.assert_eq(p.0.last_field_id, 1)
+            test.assert_eq(landed(dst, 1), "15")
+
+    test.case("a delta past fifteen is the type byte and a zigzag id: 05 c801")
+    var far = room(8)
+    match pqthrift.write_field(fresh_writer(), 100, PqThriftI32, far)
+        Ok(p)  =>
+            test.assert_eq(p.1, 3)
+            test.assert_eq(landed(far, 3), "05c801")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_stop_byte_is_a_zero_and_restores_the_parent_id() [io]
+    var dst = room(4)
+    let inside = PqThriftWriter { written: 6, last_field_id: 2, stack: [7] }
+
+    match pqthrift.write_stop(inside, dst)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.assert_eq(p.1, 1)
+            test.assert_eq(landed(dst, 1), "00")
+            test.assert_eq(p.0.last_field_id, 7)
+            test.assert_eq(list.len(p.0.stack), 0)
+
+@test
+fn test_the_writers_mirror_the_readers_byte_for_byte() [io]
+    test.case("300 as an unsigned varint is ac02")
+    var a = room(4)
+    match pqthrift.write_varint(300, a)
+        Ok(n)  =>
+            test.assert_eq(n, 2)
+            test.assert_eq(landed(a, 2), "ac02")
+        Err(_) => test.assert(false)
+
+    test.case("-1 as a zigzag varint is 01")
+    var b = room(4)
+    match pqthrift.write_zigzag(0 - 1, b)
+        Ok(n)  =>
+            test.assert_eq(n, 1)
+            test.assert_eq(landed(b, 1), "01")
+        Err(_) => test.assert(false)
+
+    test.case("a binary payload is its length and then its bytes")
+    var c = room(8)
+    match pqthrift.write_binary(bytes.from_str("hours"), c)
+        Ok(n)  =>
+            test.assert_eq(n, 6)
+            test.assert_eq(landed(c, 6), "05686f757273")
+        Err(_) => test.assert(false)
+
+    test.case("a list of three I32 is the single byte 35")
+    var d = room(4)
+    match pqthrift.write_list_header(PqThriftI32, 3, d)
+        Ok(n)  =>
+            test.assert_eq(n, 1)
+            test.assert_eq(landed(d, 1), "35")
+        Err(_) => test.assert(false)
+
+    test.case("a list of twenty moves the count to a varint: f514")
+    var e = room(4)
+    match pqthrift.write_list_header(PqThriftI32, 20, e)
+        Ok(n)  =>
+            test.assert_eq(n, 2)
+            test.assert_eq(landed(e, 2), "f514")
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_write_past_the_cursor_room_is_refused() [io]
+    var tiny = room(1)
+    match pqthrift.write_varint(300, tiny)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_varint_lengths_are_seven_bits_per_byte() [io]
+    test.case("127 is the last one-byte value and 128 the first two-byte one")
+    test.assert_eq(pqthrift.varint_len(127), 1)
+    test.assert_eq(pqthrift.varint_len(128), 2)
+    test.assert_eq(pqthrift.varint_len(300), 2)
+
+    test.case("a zigzag doubles the magnitude, so -1 is one byte and 64 is two")
+    test.assert_eq(pqthrift.zigzag_len(0 - 1), 1)
+    test.assert_eq(pqthrift.zigzag_len(63), 1)
+    test.assert_eq(pqthrift.zigzag_len(64), 2)
